@@ -492,7 +492,7 @@ def keep_mongodb_alive():
         global MONGO_PIPELINE
         global MONGO_PIPELINE_RANK
         
-        if MONGO_PIPELINE and MONGO_PIPELINE.client:
+        if MONGO_PIPELINE is not None and MONGO_PIPELINE.client is not None:
             try:
                 MONGO_PIPELINE.client.admin.command('ping')
                 print('[MongoDB KeepAlive] ✅ MONGO_PIPELINE ping successful')
@@ -504,7 +504,7 @@ def keep_mongodb_alive():
                 except Exception as reconnect_err:
                     print(f'[MongoDB KeepAlive] ❌ MONGO_PIPELINE reconnect failed: {reconnect_err}')
         
-        if MONGO_PIPELINE_RANK:
+        if MONGO_PIPELINE_RANK is not None:
             try:
                 MONGO_PIPELINE_RANK.database.client.admin.command('ping')
                 print('[MongoDB KeepAlive] ✅ MONGO_PIPELINE_RANK ping successful')
