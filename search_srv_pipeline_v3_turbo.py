@@ -305,19 +305,21 @@ TOKEN_ENCODE_MODEL = 'gpt-3.5-turbo'
 CONCAT_CHUNK_NUM = 4
 
 # ⭐ 优化配置
-MONGO_PARALLEL_WORKERS = 2  # 并行查询线程数（降低避免压力过大）
+MONGO_PARALLEL_WORKERS = 5  # 并行查询线程数（提升到 5 以加快速度）
 MONGO_MAX_TIME_MS = 180000  # MongoDB 查询超时：180 秒
 
 def get_optimal_batch_size(total_conditions):
     """⭐ 动态批次大小：根据查询条数优化"""
-    if total_conditions < 1000:
-        return 150  # 小查询：7 批
+    if total_conditions < 500:
+        return 500  # 小查询：1 批（快速）
+    elif total_conditions < 1000:
+        return 250  # 小查询：4 批
     elif total_conditions < 2000:
-        return 200  # 中查询：10 批
+        return 300  # 中查询：7 批
     elif total_conditions < 3000:
-        return 250  # 大查询：12 批
+        return 400  # 大查询：8 批
     else:
-        return 250  # 超大查询：16 批（4000 条 = 16 批）
+        return 500  # 超大查询：8 批（4000 条 = 8 批）
 
 MEMORY_KEYWORD_MATCH = {}
 MEMORY_QUERY_MATCH = {}
