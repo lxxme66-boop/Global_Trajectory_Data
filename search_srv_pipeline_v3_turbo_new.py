@@ -223,7 +223,7 @@ class mongodb:
         self.db = self.client[self.db_name]
         print(f'[MongoDB] Connected to {self.db_name}, collections={self.db.list_collection_names()[:5]}...')
         self.collection = self.db[self.table_name]
-        print(f'[MongoDB] Pool: max={self.client.max_pool_size}, min={self.client.min_pool_size}')
+        print(f'[MongoDB] Pool: max=50, min=10')
         
         # ⭐ 连接预热：提前创建连接
         self._warm_up_connections()
@@ -232,8 +232,8 @@ class mongodb:
         """预热连接池"""
         try:
             print('[MongoDB] 🔥 Warming up connection pool...')
-            # 执行简单查询来预热连接
-            for _ in range(min(5, self.client.min_pool_size)):
+            # 执行简单查询来预热连接（预热 5 个连接）
+            for _ in range(5):
                 try:
                     self.collection.find_one({}, {'_id': 1})
                 except:
@@ -431,11 +431,11 @@ def load_data(table: str, model_name: str):
     db = client[MONGO_DB]
     MONGO_PIPELINE_RANK = db[MONGODB_C_NAME]
     
-    print(f'[MongoDB] Rank collection connected (pool: max={client.max_pool_size}, min={client.min_pool_size})')
+    print(f'[MongoDB] Rank collection connected (pool: max=50, min=10)')
     
-    # ⭐ 连接预热：提前创建连接
+    # ⭐ 连接预热：提前创建连接（预热 5 个连接）
     print('[MongoDB] 🔥 Warming up rank collection connection pool...')
-    for _ in range(min(5, client.min_pool_size)):
+    for _ in range(5):
         try:
             MONGO_PIPELINE_RANK.find_one({}, {'_id': 1})
         except:
