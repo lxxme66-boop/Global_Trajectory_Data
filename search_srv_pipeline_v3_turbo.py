@@ -231,18 +231,19 @@ TOKEN_ENCODE_MODEL = 'gpt-3.5-turbo'
 CONCAT_CHUNK_NUM = 4
 
 # ⭐ 优化配置
-MONGO_PARALLEL_WORKERS = 4  # 并行查询线程数
+MONGO_PARALLEL_WORKERS = 2  # 并行查询线程数（降低避免压力过大）
+MONGO_MAX_TIME_MS = 180000  # MongoDB 查询超时：180 秒
 
 def get_optimal_batch_size(total_conditions):
     """⭐ 动态批次大小：根据查询条数优化"""
     if total_conditions < 1000:
-        return 250  # 小查询：4 批
+        return 200  # 小查询：5 批（减小批次）
     elif total_conditions < 2000:
-        return 400  # 中查询：5 批
+        return 300  # 中查询：7 批（减小批次）
     elif total_conditions < 3000:
-        return 500  # 大查询：6 批
+        return 350  # 大查询：9 批（减小批次）
     else:
-        return 600  # 超大查询：7 批
+        return 400  # 超大查询：10 批（减小批次）
 
 MEMORY_KEYWORD_MATCH = {}
 MEMORY_QUERY_MATCH = {}
@@ -511,7 +512,7 @@ def recall_pipeline(**kwargs):
     return kwargs
 
 # ⭐⭐⭐ 优化：并行批量查询 MongoDB
-@mongodb_retry(max_retries=3, initial_delay=2)
+@mongodb_retry(max_retries=5, initial_delay=3)
 def query_embeddings_batch(mongo_collection, batch_conditions, batch_id, total_batches):
     """分批查询 embeddings（带重试）"""
     if not batch_conditions:
@@ -521,15 +522,36 @@ def query_embeddings_batch(mongo_collection, batch_conditions, batch_id, total_b
     
     batch_start = time.time()
     
-    score_iter = mongo_collection.find(
-        find_condition,
-        {'_id': 0, 'index': 1, 'doc_id': 1, 'embedding': 1}
-    ).max_time_ms(60000)
+    print(f'[MongoDB Batch {batch_id}/{total_batches}] 🔄 Querying {len(batch_conditions)} conditions...')
     
-    results = list(score_iter)
-    
-    print(f'[MongoDB Batch {batch_id}/{total_batches}] ✅ {len(results)} records in {time.time() - batch_start:.2f}s')
-    return results
+    try:
+        score_iter = mongo_collection.find(
+            find_condition,
+            {'_id': 0, 'index': 1, 'doc_id': 1, 'embedding': 1}
+        ).max_time_ms(MONGO_MAX_TIME_MS)  # 使用全局配置的超时时间
+        
+        results = list(score_iter)
+        
+        elapsed = time.time() - batch_start
+        print(f'[MongoDB Batch {batch_id}/{total_batches}] ✅ {len(results)} records in {elapsed:.2f}s')
+        return results
+        
+    except pymongo.errors.ExecutionTimeout as e:
+        elapsed = time.time() - batch_start
+        print(f'[MongoDB Batch {batch_id}/{total_batches}] ⏰ TIMEOUT after {elapsed:.2f}s, reducing batch size and retrying...')
+        
+        # 超时时自动拆分为更小的批次
+        if len(batch_conditions) > 50:
+            mid = len(batch_conditions) // 2
+            print(f'[MongoDB Batch {batch_id}/{total_batches}] 🔀 Splitting into 2 sub-batches: {mid} + {len(batch_conditions) - mid}')
+            
+            results1 = query_embeddings_batch(mongo_collection, batch_conditions[:mid], f'{batch_id}.1', total_batches)
+            results2 = query_embeddings_batch(mongo_collection, batch_conditions[mid:], f'{batch_id}.2', total_batches)
+            
+            return results1 + results2
+        else:
+            # 批次已经很小了，直接抛出异常
+            raise
 
 def rank_pipeline(**kwargs):
     """排序 pipeline - 并行批量查询优化"""
@@ -600,7 +622,13 @@ def rank_pipeline(**kwargs):
                 
             except Exception as e:
                 failed_batches += 1
-                print(f'[Rank] ❌ Batch {batch_id} FAILED: {e}')
+                error_msg = str(e)
+                # 只打印简短的错误信息，避免日志刷屏
+                if 'MaxTimeMSExpired' in error_msg or 'time limit' in error_msg:
+                    print(f'[Rank] ❌ Batch {batch_id} TIMEOUT (will retry with smaller batch)')
+                else:
+                    print(f'[Rank] ❌ Batch {batch_id} FAILED: {error_msg[:100]}...')
+                # 继续处理其他批次，不中断
     
     print(f'[Rank] ✅ PARALLEL query done: success={successful_batches}/{total_batches}, failed={failed_batches}, embed_info={len(embed_info)}, time={time.time() - search_start_time:.2f}s')
     
