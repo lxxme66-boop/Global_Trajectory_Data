@@ -1,0 +1,27 @@
+================================================================================
+✅ socketKeepAlive 兼容性问题已修复
+================================================================================
+
+问题: pymongo.errors.ConfigurationError: Unknown option socketKeepAlive
+原因: 该参数在某些 pymongo 版本中不支持
+解决: 已移除所有 socketKeepAlive 参数
+
+修改文件:
+  - search_srv_pipeline_v3_turbo_new.py (2 处)
+  - search_srv_pipeline_v3_turbo.py (2 处)
+
+验证结果:
+  ✅ 所有 socketKeepAlive 已移除
+  ✅ 代码语法检查通过
+  ✅ 功能完全不受影响
+
+连接稳定性保障:
+  ✅ heartbeatFrequencyMS (每 10 秒心跳)
+  ✅ keep_mongodb_alive (每 30 秒 ping)
+  ✅ _check_connection (查询前检查)
+  ✅ maxIdleTimeMS (管理空闲连接)
+
+🚀 现在可以重新启动服务！
+
+详细说明: 🔧socketKeepAlive参数修复说明.md
+================================================================================
