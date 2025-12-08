@@ -180,7 +180,6 @@ class mongodb:
             # 启用连接检查
             connect=True,  # 立即连接并检查
             heartbeatFrequencyMS=10000,  # 每 10 秒心跳检查
-            serverSelectionTryOnce=False,  # 允许多次尝试
         )
         self.db = self.client[self.db_name]
         print(f'[MongoDB] Connected to {self.db_name}, collections={self.db.list_collection_names()[:5]}...')
@@ -356,7 +355,6 @@ def load_data(table: str, model_name: str):
         # 启用连接检查
         connect=True,  # 立即连接并检查
         heartbeatFrequencyMS=10000,  # 每 10 秒心跳检查
-        serverSelectionTryOnce=False,  # 允许多次尝试
     )
     db = client[MONGO_DB]
     MONGO_PIPELINE_RANK = db[MONGODB_C_NAME]
