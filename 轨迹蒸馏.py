@@ -458,6 +458,13 @@ def process_single_question(qa_item: Dict[str, Any]) -> Tuple[bool, Dict[str, An
             if not json_content_str:
                 raise json.JSONDecodeError("提取的 JSON 字符串为空", json_content_str, 0)
             
+            # [FIX] 修复JSON中的反斜杠转义问题 (例如LaTeX符号 \alpha)
+            # 将所有单个反斜杠替换为双反斜杠,但保留已经正确转义的
+            import re
+            # 替换所有不是合法JSON转义序列的反斜杠
+            # 合法的转义序列: \", \\, \/, \b, \f, \n, \r, \t, \uXXXX
+            json_content_str = re.sub(r'\\(?!["\\/bfnrtu])', r'\\\\', json_content_str)
+            
             judge_output = json.loads(json_content_str)
             
             knowledge_gap = judge_output.get("knowledge_gap", False)
