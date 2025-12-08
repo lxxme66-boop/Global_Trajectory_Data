@@ -137,14 +137,9 @@ def process_questions_sequentially():
             if result['success'] and result['doc_num'] > 0:
                 success_count += 1
                 
-                # 保存到文件
+                # 只保存问题本身
                 output_data = {
-                    'index': idx,
-                    'query': question,
-                    'information': result['information'],
-                    'sources': result['sources'],
-                    'chunks': result['chunks'],
-                    'doc_num': result['doc_num']
+                    'question': question
                 }
                 output_file.write(json.dumps(output_data, ensure_ascii=False) + '\n')
                 output_file.flush()  # 立即写入磁盘
