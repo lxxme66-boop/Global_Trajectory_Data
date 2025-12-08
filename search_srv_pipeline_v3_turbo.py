@@ -62,6 +62,43 @@ ENCODE_CACHE_MAX_SIZE = 1000  # 最大缓存 1000 条
 ENCODE_CACHE_HIT = 0
 ENCODE_CACHE_MISS = 0
 
+# ==================== 监控统计 ====================
+MONGODB_QUERY_STATS = {
+    'total_queries': 0,
+    'successful_queries': 0,
+    'failed_queries': 0,
+    'timeout_queries': 0,
+    'retry_queries': 0,
+    'total_query_time': 0.0,
+}
+MONGODB_STATS_LOCK = threading.Lock()
+
+def update_mongodb_stats(success=True, timeout=False, retry=False, query_time=0.0):
+    """更新 MongoDB 查询统计"""
+    with MONGODB_STATS_LOCK:
+        MONGODB_QUERY_STATS['total_queries'] += 1
+        if success:
+            MONGODB_QUERY_STATS['successful_queries'] += 1
+        else:
+            MONGODB_QUERY_STATS['failed_queries'] += 1
+        if timeout:
+            MONGODB_QUERY_STATS['timeout_queries'] += 1
+        if retry:
+            MONGODB_QUERY_STATS['retry_queries'] += 1
+        MONGODB_QUERY_STATS['total_query_time'] += query_time
+
+def get_mongodb_stats():
+    """获取 MongoDB 查询统计"""
+    with MONGODB_STATS_LOCK:
+        stats = MONGODB_QUERY_STATS.copy()
+        if stats['total_queries'] > 0:
+            stats['success_rate'] = f"{stats['successful_queries'] / stats['total_queries'] * 100:.1f}%"
+            stats['avg_query_time'] = f"{stats['total_query_time'] / stats['total_queries']:.3f}s"
+        else:
+            stats['success_rate'] = 'N/A'
+            stats['avg_query_time'] = 'N/A'
+        return stats
+
 def get_cache_stats():
     """获取缓存统计"""
     total = ENCODE_CACHE_HIT + ENCODE_CACHE_MISS
@@ -163,34 +200,70 @@ class mongodb:
         self.client = None
         self.db = None
         self.collection = None
+        self.last_ping = 0  # 上次 ping 时间戳
+        self.ping_interval = 30  # ping 间隔（秒）
 
     def connect(self):
-        """连接 MongoDB - 超级健壮配置"""
+        """连接 MongoDB - 超级健壮配置（增强版）"""
         self.client = pymongo.MongoClient(
             self.url, 
-            maxPoolSize=30,  # 进一步减少连接池大小
-            minPoolSize=5,
-            maxIdleTimeMS=60000,  # 1 分钟（减少空闲时间，避免被服务器关闭）
-            connectTimeoutMS=60000,
-            socketTimeoutMS=180000,  # 3 分钟
-            serverSelectionTimeoutMS=60000,
+            maxPoolSize=50,  # ⭐ 增加连接池大小以支持更高并发
+            minPoolSize=10,  # ⭐ 增加最小连接数，保持热连接
+            maxIdleTimeMS=45000,  # ⭐ 45 秒空闲超时（低于服务器的 60 秒）
+            connectTimeoutMS=30000,  # ⭐ 30 秒连接超时
+            socketTimeoutMS=180000,  # 3 分钟 socket 超时
+            serverSelectionTimeoutMS=30000,  # ⭐ 30 秒服务器选择超时
             retryReads=True,
             retryWrites=True,
-            waitQueueTimeoutMS=300000,  # 5 分钟
+            waitQueueTimeoutMS=120000,  # ⭐ 2 分钟等待队列超时
             # 启用连接检查
             connect=True,  # 立即连接并检查
             heartbeatFrequencyMS=10000,  # 每 10 秒心跳检查
+            # ⭐ 新增：TCP keepalive 设置
+            socketKeepAlive=True,
         )
         self.db = self.client[self.db_name]
         print(f'[MongoDB] Connected to {self.db_name}, collections={self.db.list_collection_names()[:5]}...')
         self.collection = self.db[self.table_name]
         print(f'[MongoDB] Pool: max={self.client.max_pool_size}, min={self.client.min_pool_size}')
+        
+        # ⭐ 连接预热：提前创建连接
+        self._warm_up_connections()
+    
+    def _warm_up_connections(self):
+        """预热连接池"""
+        try:
+            print('[MongoDB] 🔥 Warming up connection pool...')
+            # 执行简单查询来预热连接
+            for _ in range(min(5, self.client.min_pool_size)):
+                try:
+                    self.collection.find_one({}, {'_id': 1})
+                except:
+                    pass
+            print('[MongoDB] ✅ Connection pool warmed up')
+        except Exception as e:
+            print(f'[MongoDB] ⚠️  Connection warm-up failed: {e}')
+    
+    def _check_connection(self):
+        """检查连接健康状态"""
+        current_time = time.time()
+        if current_time - self.last_ping > self.ping_interval:
+            try:
+                self.client.admin.command('ping')
+                self.last_ping = current_time
+                return True
+            except Exception as e:
+                print(f'[MongoDB] ⚠️  Connection health check failed: {e}')
+                return False
+        return True
     
     def insert_one(self, data):
+        self._check_connection()
         result = self.collection.insert_one(data)
         return
 
     def find_data(self, conditions):
+        self._check_connection()
         return self.collection.find(conditions)
 
 sys.path.append("..")
@@ -341,25 +414,37 @@ def load_data(table: str, model_name: str):
     MONGO_PIPELINE = mongodb(MONGO_URL, MONGO_DB, table)
     MONGO_PIPELINE.connect()
     
+    # ⭐ 优化：使用增强的连接池配置
     client = pymongo.MongoClient(
         "mongodb://root:example@10.70.223.31:27017", 
-        maxPoolSize=30,  # 进一步减少连接池大小
-        minPoolSize=5,
-        maxIdleTimeMS=60000,  # 1 分钟（减少空闲时间，避免被服务器关闭）
-        connectTimeoutMS=60000,
-        socketTimeoutMS=180000,  # 3 分钟
-        serverSelectionTimeoutMS=60000,
+        maxPoolSize=50,  # ⭐ 增加连接池大小
+        minPoolSize=10,  # ⭐ 增加最小连接数
+        maxIdleTimeMS=45000,  # ⭐ 45 秒空闲超时
+        connectTimeoutMS=30000,  # ⭐ 30 秒连接超时
+        socketTimeoutMS=180000,  # 3 分钟 socket 超时
+        serverSelectionTimeoutMS=30000,  # ⭐ 30 秒服务器选择超时
         retryReads=True,
         retryWrites=True,
-        waitQueueTimeoutMS=300000,  # 5 分钟
+        waitQueueTimeoutMS=120000,  # ⭐ 2 分钟等待队列超时
         # 启用连接检查
         connect=True,  # 立即连接并检查
         heartbeatFrequencyMS=10000,  # 每 10 秒心跳检查
+        # ⭐ 新增：TCP keepalive
+        socketKeepAlive=True,
     )
     db = client[MONGO_DB]
     MONGO_PIPELINE_RANK = db[MONGODB_C_NAME]
     
-    print(f'[MongoDB] Rank collection connected')
+    print(f'[MongoDB] Rank collection connected (pool: max={client.max_pool_size}, min={client.min_pool_size})')
+    
+    # ⭐ 连接预热：提前创建连接
+    print('[MongoDB] 🔥 Warming up rank collection connection pool...')
+    for _ in range(min(5, client.min_pool_size)):
+        try:
+            MONGO_PIPELINE_RANK.find_one({}, {'_id': 1})
+        except:
+            pass
+    print('[MongoDB] ✅ Rank collection connection pool warmed up')
 
     jieba.load_userdict("config/ext_dict2.dct")
     ENCODING = tiktoken.encoding_for_model(TOKEN_ENCODE_MODEL)
@@ -404,6 +489,34 @@ def crontab_update_config():
 
     print(f'[Config Update] TOKEN_LIMIT={TOKEN_LIMIT}, SCORE_THREHOLD={SCORE_THREHOLD}')
     return
+
+def keep_mongodb_alive():
+    """⭐ 定期 ping MongoDB 以保持连接活跃"""
+    try:
+        global MONGO_PIPELINE
+        global MONGO_PIPELINE_RANK
+        
+        if MONGO_PIPELINE and MONGO_PIPELINE.client:
+            try:
+                MONGO_PIPELINE.client.admin.command('ping')
+                print('[MongoDB KeepAlive] ✅ MONGO_PIPELINE ping successful')
+            except Exception as e:
+                print(f'[MongoDB KeepAlive] ⚠️  MONGO_PIPELINE ping failed: {e}, attempting reconnect...')
+                try:
+                    MONGO_PIPELINE.connect()
+                    print('[MongoDB KeepAlive] ✅ MONGO_PIPELINE reconnected')
+                except Exception as reconnect_err:
+                    print(f'[MongoDB KeepAlive] ❌ MONGO_PIPELINE reconnect failed: {reconnect_err}')
+        
+        if MONGO_PIPELINE_RANK:
+            try:
+                MONGO_PIPELINE_RANK.database.client.admin.command('ping')
+                print('[MongoDB KeepAlive] ✅ MONGO_PIPELINE_RANK ping successful')
+            except Exception as e:
+                print(f'[MongoDB KeepAlive] ⚠️  MONGO_PIPELINE_RANK ping failed: {e}')
+        
+    except Exception as e:
+        print(f'[MongoDB KeepAlive] ❌ Error: {e}')
 
 def check_query_relevance(query: str) -> bool:
     """检查查询相关性"""
@@ -520,13 +633,15 @@ def recall_pipeline(**kwargs):
 # ⭐⭐⭐ 优化：并行批量查询 MongoDB
 @mongodb_retry(max_retries=5, initial_delay=3)
 def query_embeddings_batch(mongo_collection, batch_conditions, batch_id, total_batches):
-    """分批查询 embeddings（带重试）"""
+    """分批查询 embeddings（带重试和监控）"""
     if not batch_conditions:
         return []
     
     find_condition = {'$or': batch_conditions}
     
     batch_start = time.time()
+    is_retry = False
+    is_timeout = False
     
     print(f'[MongoDB Batch {batch_id}/{total_batches}] 🔄 Querying {len(batch_conditions)} conditions...')
     
@@ -538,6 +653,7 @@ def query_embeddings_batch(mongo_collection, batch_conditions, batch_id, total_b
             print(f'[MongoDB Batch {batch_id}/{total_batches}] ⚠️  Connection test failed: {ping_error}, reconnecting...')
             # 连接失效，等待自动重连
             time.sleep(1)
+            is_retry = True
         
 
         score_iter = mongo_collection.find(
@@ -549,11 +665,19 @@ def query_embeddings_batch(mongo_collection, batch_conditions, batch_id, total_b
         
         elapsed = time.time() - batch_start
         print(f'[MongoDB Batch {batch_id}/{total_batches}] ✅ {len(results)} records in {elapsed:.2f}s')
+        
+        # ⭐ 更新统计
+        update_mongodb_stats(success=True, timeout=False, retry=is_retry, query_time=elapsed)
+        
         return results
         
     except pymongo.errors.ExecutionTimeout as e:
         elapsed = time.time() - batch_start
+        is_timeout = True
         print(f'[MongoDB Batch {batch_id}/{total_batches}] ⏰ TIMEOUT after {elapsed:.2f}s, reducing batch size and retrying...')
+        
+        # ⭐ 更新统计
+        update_mongodb_stats(success=False, timeout=True, retry=True, query_time=elapsed)
         
         # 超时时自动拆分为更小的批次
         if len(batch_conditions) > 50:
@@ -567,6 +691,77 @@ def query_embeddings_batch(mongo_collection, batch_conditions, batch_id, total_b
         else:
             # 批次已经很小了，直接抛出异常
             raise
+    except Exception as e:
+        elapsed = time.time() - batch_start
+        print(f'[MongoDB Batch {batch_id}/{total_batches}] ❌ ERROR: {str(e)[:150]}...')
+        
+        # ⭐ 更新统计
+        update_mongodb_stats(success=False, timeout=False, retry=is_retry, query_time=elapsed)
+        
+        raise
+
+# ⭐⭐⭐ 新增：批量查询数据（带重试、超时保护和监控）
+@mongodb_retry(max_retries=5, initial_delay=3)
+def query_data_batch(mongo_collection, batch_conditions, batch_id, total_batches):
+    """分批查询数据（带重试、超时保护和监控）"""
+    if not batch_conditions:
+        return []
+    
+    find_condition = {'$or': batch_conditions}
+    
+    batch_start = time.time()
+    is_retry = False
+    
+    print(f'[MongoDB Data Batch {batch_id}/{total_batches}] 🔄 Querying {len(batch_conditions)} conditions...')
+    
+    try:
+        # 在查询前先测试连接是否有效
+        try:
+            mongo_collection.database.client.admin.command('ping')
+        except Exception as ping_error:
+            print(f'[MongoDB Data Batch {batch_id}/{total_batches}] ⚠️  Connection test failed: {ping_error}, reconnecting...')
+            time.sleep(1)
+            is_retry = True
+        
+        # 添加超时保护
+        data_cursor = mongo_collection.find(find_condition).max_time_ms(MONGO_MAX_TIME_MS)
+        results = list(data_cursor)
+        
+        elapsed = time.time() - batch_start
+        print(f'[MongoDB Data Batch {batch_id}/{total_batches}] ✅ {len(results)} records in {elapsed:.2f}s')
+        
+        # ⭐ 更新统计
+        update_mongodb_stats(success=True, timeout=False, retry=is_retry, query_time=elapsed)
+        
+        return results
+        
+    except pymongo.errors.ExecutionTimeout as e:
+        elapsed = time.time() - batch_start
+        print(f'[MongoDB Data Batch {batch_id}/{total_batches}] ⏰ TIMEOUT after {elapsed:.2f}s, reducing batch size and retrying...')
+        
+        # ⭐ 更新统计
+        update_mongodb_stats(success=False, timeout=True, retry=True, query_time=elapsed)
+        
+        # 超时时自动拆分为更小的批次
+        if len(batch_conditions) > 50:
+            mid = len(batch_conditions) // 2
+            print(f'[MongoDB Data Batch {batch_id}/{total_batches}] 🔀 Splitting into 2 sub-batches: {mid} + {len(batch_conditions) - mid}')
+            
+            results1 = query_data_batch(mongo_collection, batch_conditions[:mid], f'{batch_id}.1', total_batches)
+            results2 = query_data_batch(mongo_collection, batch_conditions[mid:], f'{batch_id}.2', total_batches)
+            
+            return results1 + results2
+        else:
+            # 批次已经很小了，直接抛出异常
+            raise
+    except Exception as e:
+        elapsed = time.time() - batch_start
+        print(f'[MongoDB Data Batch {batch_id}/{total_batches}] ❌ ERROR: {str(e)[:150]}...')
+        
+        # ⭐ 更新统计
+        update_mongodb_stats(success=False, timeout=False, retry=is_retry, query_time=elapsed)
+        
+        raise
 
 def rank_pipeline(**kwargs):
     """排序 pipeline - 并行批量查询优化"""
@@ -647,9 +842,43 @@ def rank_pipeline(**kwargs):
     
     print(f'[Rank] ✅ PARALLEL query done: success={successful_batches}/{total_batches}, failed={failed_batches}, embed_info={len(embed_info)}, time={time.time() - search_start_time:.2f}s')
     
-    # 查询切片数据
-    find_condition = {'$or': search_conditions} if search_conditions else {}
-    data_iter = list(MONGO_PIPELINE.find_data(find_condition))
+    # ⭐⭐⭐ 优化：查询切片数据（使用批量查询，添加重试和超时保护）
+    data_query_start = time.time()
+    data_iter = []
+    
+    if search_conditions:
+        # 使用批量并行查询，带重试和超时保护
+        DATA_BATCH_SIZE = get_optimal_batch_size(len(search_conditions))
+        data_total_batches = (len(search_conditions) + DATA_BATCH_SIZE - 1) // DATA_BATCH_SIZE
+        
+        print(f'[Rank] 🔄 Querying shard data: {len(search_conditions)} conditions, batch_size={DATA_BATCH_SIZE}, batches={data_total_batches}')
+        
+        with ThreadPoolExecutor(max_workers=MONGO_PARALLEL_WORKERS) as executor:
+            data_futures = []
+            for i in range(0, len(search_conditions), DATA_BATCH_SIZE):
+                batch_id = i // DATA_BATCH_SIZE + 1
+                batch_conditions = search_conditions[i:i + DATA_BATCH_SIZE]
+                
+                future = executor.submit(
+                    query_data_batch,
+                    MONGO_PIPELINE.collection,
+                    batch_conditions,
+                    batch_id,
+                    data_total_batches
+                )
+                data_futures.append(future)
+            
+            # 收集结果
+            for future in as_completed(data_futures):
+                try:
+                    batch_data = future.result()
+                    data_iter.extend(batch_data)
+                except Exception as e:
+                    print(f'[Rank] ❌ Data batch query failed: {str(e)[:100]}...')
+                    # 继续处理其他批次
+        
+        print(f'[Rank] ✅ Shard data query done: {len(data_iter)} records in {time.time() - data_query_start:.2f}s')
+    
     cnt = 0
     
     for dct in data_iter:
@@ -702,11 +931,44 @@ def rank_pipeline(**kwargs):
                     keyword_docid[doc] = w
 
     if keyword_docid:
-        find_condition2 = {'doc_id': {'$in': list(keyword_docid.keys())}}
-        data_iter2 = list(MONGO_PIPELINE.find_data(find_condition2))
-        
-        # 同样使用并行查询
+        # ⭐⭐⭐ 优化：使用批量查询（带重试和超时保护）
         score_conditions2 = [{'doc_id': doc_id} for doc_id in keyword_docid.keys()]
+        
+        # 查询关键词增强的数据
+        keyword_data_start = time.time()
+        data_iter2 = []
+        
+        if score_conditions2:
+            KEYWORD_BATCH_SIZE = get_optimal_batch_size(len(score_conditions2))
+            keyword_total_batches = (len(score_conditions2) + KEYWORD_BATCH_SIZE - 1) // KEYWORD_BATCH_SIZE
+            
+            print(f'[Rank] 🔄 Querying keyword-boosted data: {len(score_conditions2)} conditions, batches={keyword_total_batches}')
+            
+            with ThreadPoolExecutor(max_workers=MONGO_PARALLEL_WORKERS) as executor:
+                keyword_data_futures = []
+                for i in range(0, len(score_conditions2), KEYWORD_BATCH_SIZE):
+                    batch_id = i // KEYWORD_BATCH_SIZE + 1
+                    batch_conditions = score_conditions2[i:i + KEYWORD_BATCH_SIZE]
+                    
+                    future = executor.submit(
+                        query_data_batch,
+                        MONGO_PIPELINE.collection,
+                        batch_conditions,
+                        batch_id,
+                        keyword_total_batches
+                    )
+                    keyword_data_futures.append(future)
+                
+                for future in as_completed(keyword_data_futures):
+                    try:
+                        batch_data = future.result()
+                        data_iter2.extend(batch_data)
+                    except Exception as e:
+                        print(f'[Rank] ❌ Keyword data batch failed: {str(e)[:100]}...')
+            
+            print(f'[Rank] ✅ Keyword-boosted data query done: {len(data_iter2)} records in {time.time() - keyword_data_start:.2f}s')
+        
+        # 同样使用并行查询 embeddings
         total_conditions2 = len(score_conditions2)
         BATCH_SIZE2 = get_optimal_batch_size(total_conditions2)
         total_batches2 = (total_conditions2 + BATCH_SIZE2 - 1) // BATCH_SIZE2
@@ -975,12 +1237,13 @@ def hello_world():
 
 @app.route('/api-rqa-search/stats', methods=['GET'])
 def get_stats():
-    """获取服务统计信息"""
+    """获取服务统计信息（增强版）"""
     stats = {
         'port': SERVER_PORT,
-        'encode_cache': get_cache_stats(),
         'version': VERSION,
         'model': MODEL_NAME,
+        'encode_cache': get_cache_stats(),
+        'mongodb': get_mongodb_stats(),  # ⭐ 新增：MongoDB 查询统计
     }
     return json_result(0, '', stats)
 
@@ -1157,6 +1420,8 @@ print(f'[Config] model={MODEL_NAME}, version={VERSION}')
 
 scheduler = BackgroundScheduler()
 scheduler.add_job(crontab_update_config, 'interval', seconds=180, coalesce=True, replace_existing=True)
+# ⭐ 新增：定期保持 MongoDB 连接活跃（每 30 秒）
+scheduler.add_job(keep_mongodb_alive, 'interval', seconds=30, coalesce=True, replace_existing=True)
 scheduler.start()
 
 load_data(TABLE_NAME, MODEL_NAME)
