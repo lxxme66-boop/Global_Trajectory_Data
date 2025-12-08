@@ -168,15 +168,15 @@ class mongodb:
         """连接 MongoDB - 超级健壮配置"""
         self.client = pymongo.MongoClient(
             self.url, 
-            maxPoolSize=100,
-            minPoolSize=20,
-            maxIdleTimeMS=120000,
+            maxPoolSize=50,  # 减少连接池大小，避免资源耗尽
+            minPoolSize=10,
+            maxIdleTimeMS=300000,  # 5 分钟
             connectTimeoutMS=60000,
-            socketTimeoutMS=120000,
+            socketTimeoutMS=180000,  # 3 分钟
             serverSelectionTimeoutMS=60000,
             retryReads=True,
             retryWrites=True,
-            waitQueueTimeoutMS=30000,
+            waitQueueTimeoutMS=300000,  # 5 分钟（从 30s 增加到 300s）
         )
         self.db = self.client[self.db_name]
         print(f'[MongoDB] Connected to {self.db_name}, collections={self.db.list_collection_names()[:5]}...')
@@ -340,15 +340,15 @@ def load_data(table: str, model_name: str):
     
     client = pymongo.MongoClient(
         "mongodb://root:example@10.70.223.31:27017", 
-        maxPoolSize=100,
-        minPoolSize=20,
-        maxIdleTimeMS=120000,
+        maxPoolSize=50,  # 减少连接池大小，避免资源耗尽
+        minPoolSize=10,
+        maxIdleTimeMS=300000,  # 5 分钟
         connectTimeoutMS=60000,
-        socketTimeoutMS=120000,
+        socketTimeoutMS=180000,  # 3 分钟
         serverSelectionTimeoutMS=60000,
         retryReads=True,
         retryWrites=True,
-        waitQueueTimeoutMS=30000,
+        waitQueueTimeoutMS=300000,  # 5 分钟（从 30s 增加到 300s）
     )
     db = client[MONGO_DB]
     MONGO_PIPELINE_RANK = db[MONGODB_C_NAME]
