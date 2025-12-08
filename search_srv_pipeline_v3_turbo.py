@@ -168,15 +168,19 @@ class mongodb:
         """连接 MongoDB - 超级健壮配置"""
         self.client = pymongo.MongoClient(
             self.url, 
-            maxPoolSize=50,  # 减少连接池大小，避免资源耗尽
-            minPoolSize=10,
-            maxIdleTimeMS=300000,  # 5 分钟
+            maxPoolSize=30,  # 进一步减少连接池大小
+            minPoolSize=5,
+            maxIdleTimeMS=60000,  # 1 分钟（减少空闲时间，避免被服务器关闭）
             connectTimeoutMS=60000,
             socketTimeoutMS=180000,  # 3 分钟
             serverSelectionTimeoutMS=60000,
             retryReads=True,
             retryWrites=True,
-            waitQueueTimeoutMS=300000,  # 5 分钟（从 30s 增加到 300s）
+            waitQueueTimeoutMS=300000,  # 5 分钟
+            # 启用连接检查
+            connect=True,  # 立即连接并检查
+            heartbeatFrequencyMS=10000,  # 每 10 秒心跳检查
+            serverSelectionTryOnce=False,  # 允许多次尝试
         )
         self.db = self.client[self.db_name]
         print(f'[MongoDB] Connected to {self.db_name}, collections={self.db.list_collection_names()[:5]}...')
@@ -237,13 +241,13 @@ MONGO_MAX_TIME_MS = 180000  # MongoDB 查询超时：180 秒
 def get_optimal_batch_size(total_conditions):
     """⭐ 动态批次大小：根据查询条数优化"""
     if total_conditions < 1000:
-        return 200  # 小查询：5 批（减小批次）
+        return 150  # 小查询：7 批
     elif total_conditions < 2000:
-        return 300  # 中查询：7 批（减小批次）
+        return 200  # 中查询：10 批
     elif total_conditions < 3000:
-        return 350  # 大查询：9 批（减小批次）
+        return 250  # 大查询：12 批
     else:
-        return 400  # 超大查询：10 批（减小批次）
+        return 250  # 超大查询：16 批（4000 条 = 16 批）
 
 MEMORY_KEYWORD_MATCH = {}
 MEMORY_QUERY_MATCH = {}
@@ -340,15 +344,19 @@ def load_data(table: str, model_name: str):
     
     client = pymongo.MongoClient(
         "mongodb://root:example@10.70.223.31:27017", 
-        maxPoolSize=50,  # 减少连接池大小，避免资源耗尽
-        minPoolSize=10,
-        maxIdleTimeMS=300000,  # 5 分钟
+        maxPoolSize=30,  # 进一步减少连接池大小
+        minPoolSize=5,
+        maxIdleTimeMS=60000,  # 1 分钟（减少空闲时间，避免被服务器关闭）
         connectTimeoutMS=60000,
         socketTimeoutMS=180000,  # 3 分钟
         serverSelectionTimeoutMS=60000,
         retryReads=True,
         retryWrites=True,
-        waitQueueTimeoutMS=300000,  # 5 分钟（从 30s 增加到 300s）
+        waitQueueTimeoutMS=300000,  # 5 分钟
+        # 启用连接检查
+        connect=True,  # 立即连接并检查
+        heartbeatFrequencyMS=10000,  # 每 10 秒心跳检查
+        serverSelectionTryOnce=False,  # 允许多次尝试
     )
     db = client[MONGO_DB]
     MONGO_PIPELINE_RANK = db[MONGODB_C_NAME]
@@ -525,6 +533,15 @@ def query_embeddings_batch(mongo_collection, batch_conditions, batch_id, total_b
     print(f'[MongoDB Batch {batch_id}/{total_batches}] 🔄 Querying {len(batch_conditions)} conditions...')
     
     try:
+        # 在查询前先测试连接是否有效
+        try:
+            mongo_collection.database.client.admin.command('ping')
+        except Exception as ping_error:
+            print(f'[MongoDB Batch {batch_id}/{total_batches}] ⚠️  Connection test failed: {ping_error}, reconnecting...')
+            # 连接失效，等待自动重连
+            time.sleep(1)
+        
+
         score_iter = mongo_collection.find(
             find_condition,
             {'_id': 0, 'index': 1, 'doc_id': 1, 'embedding': 1}
