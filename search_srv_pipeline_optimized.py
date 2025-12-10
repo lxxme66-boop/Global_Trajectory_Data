@@ -174,8 +174,8 @@ def safe_execute(func, timeout=None, default=None, operation_name="", raise_exce
         try:
             return func()
         except Exception as e:
-            if DEBUG_MODE:
-                print(f'[SafeExecute] {operation_name} failed: {str(e)[:200]}')
+            # ✅ 强制打印错误，不依赖DEBUG_MODE
+            print(f'⚠️  [SafeExecute] {operation_name} failed: {str(e)[:200]}')
             if raise_exception:
                 raise
             return default
@@ -183,14 +183,13 @@ def safe_execute(func, timeout=None, default=None, operation_name="", raise_exce
         try:
             return SafeTimeout.run_with_timeout(func, timeout, operation_name)
         except OperationTimeoutError as e:
-            if DEBUG_MODE:
-                print(f'[SafeExecute] {operation_name} timeout: {e}')
+            print(f'⚠️  [SafeExecute] {operation_name} timeout: {e}')
             if raise_exception:
                 raise
             return default
         except Exception as e:
-            if DEBUG_MODE:
-                print(f'[SafeExecute] {operation_name} failed: {str(e)[:200]}')
+            # ✅ 强制打印错误，便于诊断
+            print(f'⚠️  [SafeExecute] {operation_name} failed: {str(e)[:200]}')
             if raise_exception:
                 raise
             return default
@@ -1470,9 +1469,19 @@ def get_data():
                     operation_name="Encoding"
                 )
                 
+                # ✅ 更严格的验证：检查None、空列表、格式错误
                 if query_embed is None:
-                    print(f'[Request {req_id}] ❌ Encoding failed after {time.time()-encoding_start:.1f}s')
-                    raise Exception("Encoding failed")
+                    print(f'[Request {req_id}] ❌ Encoding failed: returned None after {time.time()-encoding_start:.1f}s')
+                    raise Exception("Encoding failed: service returned None")
+                
+                if not isinstance(query_embed, list) or len(query_embed) == 0:
+                    print(f'[Request {req_id}] ❌ Encoding failed: invalid format or empty, type={type(query_embed)}, len={len(query_embed) if isinstance(query_embed, list) else "N/A"}')
+                    raise Exception(f"Encoding failed: invalid result format")
+                
+                # 检查第一个元素是否为有效的embedding
+                if not isinstance(query_embed[0], (list, tuple)) or len(query_embed[0]) == 0:
+                    print(f'[Request {req_id}] ❌ Encoding failed: invalid embedding format')
+                    raise Exception("Encoding failed: invalid embedding format")
                 
                 print(f'[Request {req_id}] ✅ Encoding completed in {time.time()-encoding_start:.1f}s')
                 MONITOR.end_stage(req_id, 'encoding')
