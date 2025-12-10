@@ -77,26 +77,55 @@ class mongodb:
         self.client = None
         self.db = None
         self.collection = None
+        self.last_ping_time = 0
+        self.ping_lock = threading.Lock()
 
     def connect(self):
-        # ✅ 修改1: 添加 maxPoolSize 和 minPoolSize 支持并发连接，避免连接关闭
+        """连接 MongoDB - 高并发优化配置"""
+        # ⭐ 关键优化：大幅增加连接池，缩短空闲超时，启用重试
         self.client = pymongo.MongoClient(
             self.url, 
-            maxPoolSize=50, 
-            minPoolSize=10,
-            maxIdleTimeMS=30000,  # 连接最大空闲时间30秒
-            connectTimeoutMS=10000,  # 连接超时10秒
-            serverSelectionTimeoutMS=10000  # 服务器选择超时10秒
+            maxPoolSize=200,  # 32并发 × 2并行 × 3倍余量 = 192
+            minPoolSize=50,   # 预热50个连接，减少动态创建
+            maxIdleTimeMS=20000,  # 20秒：远小于MongoDB服务器默认超时
+            connectTimeoutMS=10000,
+            socketTimeoutMS=60000,  # ⭐ 关键：60秒socket超时，避免长时间挂起
+            serverSelectionTimeoutMS=10000,
+            waitQueueTimeoutMS=30000,  # ⭐ 队列等待超时
+            retryReads=True,  # ⭐ 启用自动重试
+            retryWrites=True,
+            connect=True,  # 立即连接
+            heartbeatFrequencyMS=3000,  # ⭐ 3秒心跳，快速检测死连接
         )
         self.db = self.client[self.db_name]
-        print(f'db {self.db} collections={self.db.list_collection_names()}')
+        print(f'[MongoDB] Connected: {self.db_name}, pool_size={self.client.max_pool_size}')
+        print(f'[MongoDB] Collections: {self.db.list_collection_names()[:5]}...')
         self.collection = self.db[self.table_name]
+        # 预热连接池
+        self.ping()
+    
+    def ping(self):
+        """定期心跳检查，验证连接存活"""
+        with self.ping_lock:
+            current_time = time.time()
+            # 每10秒ping一次
+            if current_time - self.last_ping_time > 10:
+                try:
+                    self.client.admin.command('ping')
+                    self.last_ping_time = current_time
+                    return True
+                except Exception as e:
+                    print(f'[MongoDB Ping] FAILED: {e}')
+                    return False
+            return True
     
     def insert_one(self, data):
         result = self.collection.insert_one(data)
         return
 
     def find_data(self, conditions):
+        # 查询前ping检查
+        self.ping()
         return self.collection.find(conditions)
 
 sys.path.append("..")
