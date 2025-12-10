@@ -31,14 +31,17 @@ from torch import nn
 from transformers import BertTokenizer, BertModel
 
 # ==================== 并发控制与连接池管理 ====================
-# ⭐ 关键优化：限制总并发数，避免连接池耗尽
-MAX_CONCURRENT_REQUESTS = 50  # 最大并发请求数（32并发测试 + 余量）
+# ⭐ 保守配置：限制总并发数，避免连接池耗尽
+MAX_CONCURRENT_REQUESTS = 40  # 最大并发请求数（32并发测试 + 少量余量，保守设置）
 REQUEST_SEMAPHORE = threading.Semaphore(MAX_CONCURRENT_REQUESTS)
 
-# MongoDB 连接池统一配置
+# 每个请求内部的并行查询线程数
+MONGO_PARALLEL_WORKERS = 2  # 保持原配置：每个请求内部并行2个查询
+
+# MongoDB 连接池统一配置（保守配置）
 MONGO_POOL_CONFIG = {
-    'maxPoolSize': 300,  # 增大连接池：50并发 × 2并行 × 3倍余量
-    'minPoolSize': 80,   # 预热80个连接
+    'maxPoolSize': 200,  # 保守配置：40并发 × 2并行 × 2.5倍余量 = 200
+    'minPoolSize': 50,   # 预热50个连接
     'maxIdleTimeMS': 15000,  # ⭐ 15秒空闲超时（远小于服务器超时）
     'connectTimeoutMS': 10000,
     'socketTimeoutMS': 60000,  # ⭐ 60秒socket超时
@@ -1091,13 +1094,14 @@ print(f'    - maxPoolSize: {MONGO_POOL_CONFIG["maxPoolSize"]}')
 print(f'    - minPoolSize: {MONGO_POOL_CONFIG["minPoolSize"]}')
 print(f'    - maxIdleTimeMS: {MONGO_POOL_CONFIG["maxIdleTimeMS"]}ms')
 print(f'    - socketTimeoutMS: {MONGO_POOL_CONFIG["socketTimeoutMS"]}ms')
-print(f'  Concurrency:')
-print(f'    - Max concurrent requests: {MAX_CONCURRENT_REQUESTS}')
+print(f'  Concurrency (Conservative):')
+print(f'    - Max concurrent requests: {MAX_CONCURRENT_REQUESTS} (保守配置)')
+print(f'    - Parallel workers per request: {MONGO_PARALLEL_WORKERS}')
 print(f'    - Rerank batch size: 50 (optimized)')
 print(f'  Optimizations:')
-print(f'    - ✅ Parallel MongoDB queries')
+print(f'    - ✅ Parallel MongoDB queries (2 workers)')
 print(f'    - ✅ Connection health check')
-print(f'    - ✅ Request-level concurrency control')
+print(f'    - ✅ Conservative concurrency control')
 print(f'    - ✅ Encode service result reuse')
 print('='*80 + '\n')
 
