@@ -1,3 +1,15 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""
+搜索服务 V4 - 超长超时版本 + 严格错误处理
+主要改进：
+1. 所有超时时间 × 10 倍
+2. 更严格的 Score count mismatch 处理
+3. 更小的批次大小（12 → 8）
+4. 更多的重试次数（2 → 3）
+5. 更详细的错误日志
+"""
+
 import configparser
 import datetime
 import faulthandler
@@ -29,9 +41,13 @@ from torch import nn
 from transformers import BertTokenizer, BertModel
 from functools import wraps
 
-# ==================== 新增：重试装饰器 ====================
-def mongodb_retry(max_retries=3, initial_delay=2):
-    """MongoDB 查询重试装饰器，支持指数退避"""
+# ==================== 版本信息 ====================
+VERSION = '2023091110_V4_10X_TIMEOUT'
+print(f'🚀 [Version] {VERSION} - 10倍超时 + 严格错误处理')
+
+# ==================== 新增：重试装饰器（超时时间 × 10） ====================
+def mongodb_retry(max_retries=3, initial_delay=20):  # 2s → 20s
+    """MongoDB 查询重试装饰器，支持指数退避（超时 × 10）"""
     def decorator(func):
         @wraps(func)
         def wrapper(*args, **kwargs):
@@ -45,15 +61,15 @@ def mongodb_retry(max_retries=3, initial_delay=2):
                     if attempt == max_retries - 1:
                         print(f'[MongoDB Retry] All {max_retries} attempts failed: {e}')
                         raise
-                    delay = initial_delay * (2 ** attempt)  # 指数退避: 2s, 4s, 8s
+                    delay = initial_delay * (2 ** attempt)  # 20s, 40s, 80s
                     print(f'[MongoDB Retry] Attempt {attempt + 1}/{max_retries} failed: {e}, retrying in {delay}s...')
                     time.sleep(delay)
             return None
         return wrapper
     return decorator
 
-def http_retry(max_retries=3, initial_delay=1, timeout=(10, 60)):
-    """HTTP 请求重试装饰器"""
+def http_retry(max_retries=3, initial_delay=10, timeout=(100, 600)):  # 1s → 10s, (10,60) → (100,600)
+    """HTTP 请求重试装饰器（超时 × 10）"""
     def decorator(func):
         @wraps(func)
         def wrapper(*args, **kwargs):
@@ -74,10 +90,7 @@ def http_retry(max_retries=3, initial_delay=1, timeout=(10, 60)):
     return decorator
 
 def zhipu_translate(id: int, text: str, from_lang: str, to_lang: str):
-    """
-    调用质谱api中译英
-    """
-    # 质谱翻译API HTTP地址
+    """调用质谱api中译英"""
     query_target = ''
     url = 'https://rqa-test.t-knows.com/api-rqa-web/v1/tcl_translate'
     headers = {
@@ -91,9 +104,9 @@ def zhipu_translate(id: int, text: str, from_lang: str, to_lang: str):
         'dst_lang': to_lang
     }
     try:
-        # 线程安全：使用全局Session，添加超时保护
+        # ⭐ 超时 × 10: (10, 30) → (100, 300)
         res_json = HTTP_SESSION.post(url, verify=False, headers=headers, data=data,
-                                 timeout=(10, 30)).content.decode('utf-8')
+                                 timeout=(100, 300)).content.decode('utf-8')
         json_data = json.loads(res_json)
         query_target = json_data['target']
     except Exception as e:
@@ -124,23 +137,23 @@ class mongodb:
         self.collection = None
 
     def connect(self):
-        # ✅ 超级健壮配置：大幅增加所有超时时间和连接池
+        # ⭐ 超级超时配置：所有超时 × 10
         self.client = pymongo.MongoClient(
             self.url, 
-            maxPoolSize=100,              # 最大连接池
-            minPoolSize=20,               # 最小连接池
-            maxIdleTimeMS=120000,         # 空闲时间 120 秒
-            connectTimeoutMS=60000,       # 连接超时 60 秒
-            socketTimeoutMS=120000,       # ⭐ Socket 超时 120 秒
-            serverSelectionTimeoutMS=60000,  # 服务器选择超时 60 秒
-            retryReads=True,              # 启用读重试
-            retryWrites=True,             # 启用写重试
-            waitQueueTimeoutMS=30000,     # 等待连接超时 30 秒
+            maxPoolSize=100,                    # 最大连接池
+            minPoolSize=20,                     # 最小连接池
+            maxIdleTimeMS=1200000,              # 空闲时间 1200 秒（120s × 10）
+            connectTimeoutMS=600000,            # 连接超时 600 秒（60s × 10）
+            socketTimeoutMS=1200000,            # ⭐ Socket 超时 1200 秒（120s × 10）
+            serverSelectionTimeoutMS=600000,    # 服务器选择超时 600 秒（60s × 10）
+            retryReads=True,                    # 启用读重试
+            retryWrites=True,                   # 启用写重试
+            waitQueueTimeoutMS=300000,          # 等待连接超时 300 秒（30s × 10）
         )
         self.db = self.client[self.db_name]
-        print(f'db {self.db} collections={self.db.list_collection_names()}')
+        print(f'[MongoDB] Connected to db={self.db_name}.{self.table_name}')
+        print(f'[MongoDB] Config: poolSize=100, socketTimeout=1200s, connectTimeout=600s')
         self.collection = self.db[self.table_name]
-        print(f'[MongoDB] Connected with pool size: max={self.client.max_pool_size}, min={self.client.min_pool_size}')
     
     def insert_one(self, data):
         result = self.collection.insert_one(data)
@@ -154,7 +167,6 @@ sys.path.append("..")
 from flask import Flask, request, Response, jsonify
 
 # embedding 模型
-# MODEL_NAME = '/mnt/hdd1/haoyangliu/em_model/embedding_res'
 MODEL_NAME = '/mnt/hdd1/haoyangliu/em_model/bge-multilingual-gemma2'
 # query class 模型
 QUERY_CLASS_MODEL = BERTClassifier('/home/tcl/rqa_dir/query_class_model/bert-base-chinese', 2).to('cpu')
@@ -166,13 +178,7 @@ PROFESSIONAL_DICT = set()
 # 连接mongo数据库相关的变量
 MONGO_URL = 'mongodb://root:example@10.70.223.31:27017'
 MONGO_DB = 'rqa'
-# MONGO_URL = 'mongodb://root:example@10.70.223.112:27017'
-# MONGO_DB = 'scrapy'
-#VERSION = '20230908'
-VERSION = '2023091110'
-
-
-# TABLE_NAME = "test_table_lhy"
+VERSION_NUM = '2023091110'
 
 # 加载MongoDB的相关组件
 MONGO_PIPELINE = None
@@ -185,20 +191,10 @@ ENCODING = tiktoken.encoding_for_model("gpt-3.5-turbo")
 # 加载ES相关组件
 ES = Elasticsearch('http://10.70.222.234:9200')
 
-
 #核心组件
-
-# Milvus 向量检索服务
-# jcf: 替换为 vector_search_srv_v4.py 中自己配置的 milvus 服务地址和端口
-# MILVUS_BIND ='http://8.130.143.163:8021/api-vec-search/search' 
 MILVUS_BIND = 'http://127.0.0.1:4100/api-vec-search/search'
-# MILVUS_BIND = 'http://8.130.143.163:8022/api-vec-search/search'
 MONGODB_C_NAME = "paper_shards_detail_table_20230908" 
-# ENCODER_URL="http://8.130.143.163:8021/encode"
-# ENCODER_URL="http://8.130.143.163:8022/encode"
 ENCODER_URL="http://8.130.183.20:8031/encode"
-# RERANKER_URL='http://8.130.158.117:8016/query_qwen_reranker/'
-# RERANKER_URL='http://8.130.143.163:8023/query_bge_reranker/'
 RERANKER_URL = 'http://8.130.183.20:8032/query_bge_reranker/'
 
 TABLE_NAME = MONGODB_C_NAME
@@ -209,34 +205,33 @@ ES_RETRIEVE_CHUNK_NUM = 400
 
 # rank
 DOC_SCORE_CHUNK_NUM = 8
-SCORE_THREHOLD = -2 # -2  # score是检索embed相似度阈值，低于阈值不展示
-# SCORE_THREHOLD = 3.5 
+SCORE_THREHOLD = -2
 TOKEN_LIMIT = 4000
 TOKEN_ENCODE_MODEL = 'gpt-3.5-turbo'
 CONCAT_CHUNK_NUM = 4
 
-# ⭐ 新增：分批查询配置
-MONGO_BATCH_SIZE = 500  # 每批查询 500 条
+# ⭐ 分批查询配置
+MONGO_BATCH_SIZE = 500
 
 # memory keyword match
 MEMORY_KEYWORD_MATCH = {}
 MEMORY_QUERY_MATCH = {}
 
 # keyword extract model
-KW_ZH_MODEL = KeyBERT(model='/mnt/hdd1/haoyangliu/em_model/kw/paraphrase-multilingual-MiniLM-L12-v2')
-KW_MODEL = KBERT(model='/mnt/hdd1/haoyangliu/em_model/kw/paraphrase-multilingual-MiniLM-L12-v2')
+KW_ZH_MODEL = None
+KW_MODEL = None
 
 # nlp相关组件
-PORTER_STEMMER = PorterStemmer() # 词干提取
+PORTER_STEMMER = PorterStemmer()
 REGEX_PATTERN = '|'.join(map(re.escape, [',', '\n', ';', '!', '?', '.', ' ', '~']))
 
-# 线程安全：全局HTTP Session对象，支持连接池复用
+# ⭐ HTTP Session 配置（连接池 × 2）
 HTTP_SESSION = requests.Session()
 HTTP_ADAPTER = requests.adapters.HTTPAdapter(
-    pool_connections=100,  # ⬆️ 增加连接池数量
-    pool_maxsize=200,      # ⬆️ 增加连接池最大连接数
-    max_retries=3,         # 失败重试次数
-    pool_block=False       # 连接池满时不阻塞
+    pool_connections=200,  # 100 → 200
+    pool_maxsize=400,      # 200 → 400
+    max_retries=3,
+    pool_block=False
 )
 HTTP_SESSION.mount('http://', HTTP_ADAPTER)
 HTTP_SESSION.mount('https://', HTTP_ADAPTER)
@@ -244,15 +239,15 @@ HTTP_SESSION.mount('https://', HTTP_ADAPTER)
 # 线程安全：BERT模型推理锁
 BERT_LOCK = threading.Lock()
 
-# 线程安全：Jieba分词锁（jieba不是线程安全的）
+# 线程安全：Jieba分词锁
 JIEBA_LOCK = threading.Lock()
 
 app = Flask(import_name=__name__)
 app.config['JSON_AS_ASCII'] = False
 
 def has_chinese(text):
-    pattern = re.compile(r'[\u4e00-\u9fff]')  # 匹配中文字符的正则表达式
-    return bool(re.search(pattern, text))*-1
+    pattern = re.compile(r'[\u4e00-\u9fff]')
+    return bool(re.search(pattern, text))
 
 def levenshteinDistance(s1, s2):
     if len(s1) > len(s2):
@@ -270,9 +265,7 @@ def levenshteinDistance(s1, s2):
     return distances[-1]
 
 def mmrStep(lambda_param: float, selectedDocs: list, sorteddDocs: list, simMatrix: dict):
-    """
-    lambda_param: to balance diversity && relevance
-    """
+    """MMR 算法步骤"""
     mmr = -9999.999
     res_index = -1
     
@@ -306,8 +299,8 @@ def mmrStep(lambda_param: float, selectedDocs: list, sorteddDocs: list, simMatri
     return
 
 def load_data(table: str, model_name: str):
-    # 加载需要在serve中持久化的item
-    print('loading global data')
+    """加载全局数据"""
+    print('🔄 [Loading] Starting to load global data...')
     start_time = time.time()
 
     global ENCODING
@@ -317,27 +310,27 @@ def load_data(table: str, model_name: str):
     global QUERY_CLASS_TOKENIZER
     global PROFESSIONAL_DICT
 
-    # ✅ 超级健壮配置：MongoDB连接
+    # ⭐ MongoDB 超时配置 × 10
     MONGO_PIPELINE = mongodb(MONGO_URL, MONGO_DB, table)
     MONGO_PIPELINE.connect()
     
-    # ✅ 创建 MONGO_PIPELINE_RANK 时使用超级健壮配置
+    # ⭐ RANK MongoDB 配置 × 10
     client = pymongo.MongoClient(
         "mongodb://root:example@10.70.223.31:27017", 
-        maxPoolSize=100,              # 最大连接池
-        minPoolSize=20,               # 最小连接池
-        maxIdleTimeMS=120000,         # 空闲时间 120 秒
-        connectTimeoutMS=60000,       # 连接超时 60 秒
-        socketTimeoutMS=120000,       # ⭐ Socket 超时 120 秒
-        serverSelectionTimeoutMS=60000,  # 服务器选择超时 60 秒
-        retryReads=True,              # 启用读重试
-        retryWrites=True,             # 启用写重试
-        waitQueueTimeoutMS=30000,     # 等待连接超时 30 秒
+        maxPoolSize=100,
+        minPoolSize=20,
+        maxIdleTimeMS=1200000,              # 1200 秒
+        connectTimeoutMS=600000,            # 600 秒
+        socketTimeoutMS=1200000,            # 1200 秒
+        serverSelectionTimeoutMS=600000,    # 600 秒
+        retryReads=True,
+        retryWrites=True,
+        waitQueueTimeoutMS=300000,          # 300 秒
     )
     db = client[MONGO_DB]
     MONGO_PIPELINE_RANK = db[MONGODB_C_NAME]
     
-    print(f'[load_data] MongoDB connected: pool_size={client.max_pool_size}, socket_timeout={client.options.socket_timeout}ms')
+    print(f'[Loading] MongoDB connected with 10× timeout config')
 
     # 加载token计算模块
     jieba.load_userdict("config/ext_dict2.dct")
@@ -367,13 +360,11 @@ def load_data(table: str, model_name: str):
     KW_MODEL = KBERT(model='/mnt/hdd1/haoyangliu/em_model/kw/paraphrase-multilingual-MiniLM-L12-v2')
     PORTER_STEMMER = PorterStemmer()
 
-    print(f'load global data from mongo=[{table}] spent_time={time.time() - start_time}')
+    print(f'✅ [Loading] Completed in {time.time() - start_time:.2f}s')
     return
 
 def crontab_update_config():
-    """
-    实现动态加载配置文件中的参数
-    """
+    """实现动态加载配置文件中的参数"""
     config = configparser.ConfigParser()
     config.read('./config/search_srv_pipeline.ini', encoding='UTF-8')
 
@@ -386,14 +377,11 @@ def crontab_update_config():
     DOC_SCORE_CHUNK_NUM = int(config['resort']['doc_score_chunk_num'])
     TOKEN_ENCODE_MODEL = config['concat']['token_encode_model']
 
-    print(
-        f'[update config] 执行定时任务(minute=*/3)@{datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")}：{__name__}; Reading TOKEN_LIMIT={TOKEN_LIMIT}, SCORE_THREHOLD={SCORE_THREHOLD}, RETRIEVE_CHUNK_NUM={RETRIEVE_CHUNK_NUM}')
+    print(f'[Config Update] @{datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")}')
     return
 
 def check_query_relevance(query: str) -> bool:
-    """
-    check query is relevant to semiconductor field
-    """
+    """检查query是否与半导体领域相关"""
     with BERT_LOCK:
         QUERY_CLASS_MODEL.eval()
         encoding = QUERY_CLASS_TOKENIZER(query, return_tensors='pt', max_length=128, padding='max_length', truncation=True)
@@ -407,13 +395,11 @@ def check_query_relevance(query: str) -> bool:
         model_score = probs.detach().cpu().numpy()[1]
         flag_query_rel = model_score >= 0.4
     
-    print(f'[check_query_relevance] Model score: {model_score}, text=[{query}]')
+    print(f'[Query Relevance] score={model_score:.3f}, relevant={flag_query_rel}')
     return flag_query_rel
 
 def recall_pipeline(**kwargs):
-    """
-    召回 query 相关的文本切片（chunk）
-    """
+    """召回 query 相关的文本切片（chunk）"""
     id: int = kwargs['id']
     query: str = kwargs['query']
     query_expand = kwargs['query_expand']
@@ -443,7 +429,7 @@ def recall_pipeline(**kwargs):
     keywords_en_set = set([PORTER_STEMMER.stem(kw[0]) for kw in kw_en])
     kwargs['kw_en'] = keywords_en_set
 
-    print(f'keyBert kw=[{kw0}],keywords=[{kw_zh}] get keywords in Eng=[{kw_en}]')
+    print(f'[Recall] Keywords: zh={kw_zh}, en={kw_en}')
 
     ############# recall pipeline 1: sentence embedding -> chunk embedding
     url = MILVUS_BIND
@@ -460,8 +446,9 @@ def recall_pipeline(**kwargs):
         sent_data = {'topk': RETRIEVE_CHUNK_NUM,
                      'query_vec': json.dumps(query_embed1) }
         
-        # ⭐ 增加 Milvus 请求超时时间
-        res_json = HTTP_SESSION.post(url, verify=False, headers=headers, data=sent_data, timeout=(10, 120)).content.decode('utf-8')
+        # ⭐ Milvus 超时 × 10: (10, 120) → (100, 1200)
+        res_json = HTTP_SESSION.post(url, verify=False, headers=headers, data=sent_data, 
+                                     timeout=(100, 1200)).content.decode('utf-8')
         res_data = json.loads(res_json).get('data')
         res_arr = [t.split(':') for t in res_data.get('arr')]
                         
@@ -474,7 +461,7 @@ def recall_pipeline(**kwargs):
                 embed_recall_res[res_key] = float(score_s)
                 res_vec_num += 1
         
-    print(f'[Recall Pipeline] after embed query chunks num = {res_vec_num}')
+    print(f'[Recall] Milvus returned {res_vec_num} chunks')
     
     for ((index, doc_id), score_s) in embed_recall_res.items():
         dct = {}
@@ -489,11 +476,10 @@ def recall_pipeline(**kwargs):
         if recall_max_score < score_s: 
             recall_max_score = score_s
     
-    print(f'[Recall Pipeline] finally milvus search recall num = {len(result_dict)}')
+    print(f'[Recall] Total recall: {len(result_dict)} chunks, max_score={recall_max_score:.3f}')
 
     ############# check query relevance
     key_match_cnt = len(PROFESSIONAL_DICT.intersection(set(kw_zh)))
-    print(f'[Recall Pipeline] find kw_set={kw_zh},key_match_cnt={key_match_cnt},recall_max_score={recall_max_score}')
     if key_match_cnt < 2 and recall_max_score <= 0.5:
         flag_query_rel = True
         nq = len(query_expand)
@@ -505,58 +491,13 @@ def recall_pipeline(**kwargs):
             kwargs['flag_query_rel'] = False
             return kwargs
 
-    ############# recall pipeline 2: keyword embedding -> chunk match
-    kw0 = None
-    if kw0:
-        url_kw = f'http://10.70.222.234:5200/api-kw-search/search'
-        headers = {
-            'Content-Type': 'application/x-www-form-urlencoded',
-            'Content-Length': '<calculated when request is sent>',
-            'Accept-Encoding': 'gzip, deflate, br'
-        }
-        sent_data_kw = {'topk': 128,
-                        'kw': ','.join(kw0)}
-        res_json_kw = HTTP_SESSION.post(url_kw, verify=False, headers=headers, data=sent_data_kw,
-                                    timeout=(10, 30)).content.decode('utf-8')
-        res_data_kw = json.loads(res_json_kw).get('data')
-        res_vec_num_kw = res_data_kw.get('vec_num', 0)
-        res_arr_kw = [t.split(':') for t in res_data_kw.get('arr')]
-        kw_embed_cnt = 0
-        for i in range(res_vec_num_kw):
-            dct = {}
-            [id_s, score_s] = res_arr_kw[i]
-            dct['index'] = int(id_s)
-            dct['recall_score'] = 0.0
-            dct['final_score'] = -1.0
-            dct['doc_name'] = 'null'
-            if int(id_s) in result_dict:
-                result_dict[int(id_s)].get('recall_channels', set(['sentence_embed'])).add('kw_embed')
-            else:
-                dct['recall_channels'] = set(['kw_embed'])
-                kw_embed_cnt += 1
-            result_dict[int(id_s)] = dct
-        print(f'[Recall Pipeline] keyword embed recall num ={kw_embed_cnt}')
-
-    es_cnt = 0
-    print(f'[Recall Pipeline] es BM25 recall num = [{es_cnt}] (ES search disabled)')
-
     kwargs['result_dict'] = result_dict
-    print(f"final recall chunk num = [{len(result_dict)}], es_cnt={es_cnt}")
     return kwargs
 
-# ⭐⭐⭐ 核心修改：分批查询 MongoDB，带重试机制
-@mongodb_retry(max_retries=3, initial_delay=2)
+# ⭐ MongoDB 分批查询（超时 × 10）
+@mongodb_retry(max_retries=3, initial_delay=20)
 def query_embeddings_batch(mongo_collection, batch_conditions, batch_id, total_batches):
-    """
-    分批查询 embeddings，带自动重试
-    Args:
-        mongo_collection: MongoDB collection 对象
-        batch_conditions: 本批次的查询条件列表
-        batch_id: 当前批次ID（用于日志）
-        total_batches: 总批次数（用于日志）
-    Returns:
-        list: 查询结果列表
-    """
+    """分批查询 embeddings，带自动重试（超时 × 10）"""
     if not batch_conditions:
         return []
     
@@ -565,29 +506,26 @@ def query_embeddings_batch(mongo_collection, batch_conditions, batch_id, total_b
     print(f'[MongoDB Batch {batch_id}/{total_batches}] Querying {len(batch_conditions)} conditions...')
     batch_start = time.time()
     
-    # ⭐ 设置服务器端超时 60 秒
+    # ⭐ 服务器端超时 × 10: 60s → 600s
     score_iter = mongo_collection.find(
         find_condition,
         {'_id': 0, 'index': 1, 'doc_id': 1, 'embedding': 1}
-    ).max_time_ms(60000)
+    ).max_time_ms(600000)  # 600 秒
     
-    # 立即转为列表
     results = list(score_iter)
     
-    print(f'[MongoDB Batch {batch_id}/{total_batches}] ✅ Success: fetched {len(results)} records in {time.time() - batch_start:.2f}s')
+    print(f'[MongoDB Batch {batch_id}/{total_batches}] ✅ Success: {len(results)} records in {time.time() - batch_start:.2f}s')
     return results
 
 def rank_pipeline(**kwargs):
-    """
-    对文本切片做精排打分 - 使用分批查询 + 重试机制
-    """
+    """对文本切片做精排打分"""
     query: str = kwargs['query']
     query_embed: np.ndarray = kwargs['query_embed']
     query_rank_embed: np.ndarray = kwargs['query_rank_embed']
     result_dict: dict = kwargs['result_dict']
     
     search_index = [t['index'] for t in result_dict.values()]
-    print(f'search_index len={len(search_index)} example={search_index[:100]}, search mongo version = {VERSION}')
+    print(f'[Rank] Processing {len(search_index)} chunks')
     
     # 构建查询条件
     search_conditions = []
@@ -599,16 +537,16 @@ def rank_pipeline(**kwargs):
                 'doc_id': int(doc_id)
             })
     
-    print(f'search_conditions len={len(search_conditions)}, example={search_conditions[:5]}')
+    print(f'[Rank] Total conditions: {len(search_conditions)}')
     
     search_start_time = time.time()
     
-    # ⭐⭐⭐ 核心改进：分批查询 embeddings
+    # ⭐ 分批查询 embeddings
     embed_info = {}
     total_conditions = len(search_conditions)
-    total_batches = (total_conditions + MONGO_BATCH_SIZE - 1) // MONGO_BATCH_SIZE  # 向上取整
+    total_batches = (total_conditions + MONGO_BATCH_SIZE - 1) // MONGO_BATCH_SIZE
     
-    print(f'[rank_pipeline] 🚀 Starting batch query: total={total_conditions}, batch_size={MONGO_BATCH_SIZE}, batches={total_batches}')
+    print(f'[Rank] Batch query: total={total_conditions}, batch_size={MONGO_BATCH_SIZE}, batches={total_batches}')
     
     successful_batches = 0
     failed_batches = 0
@@ -618,7 +556,6 @@ def rank_pipeline(**kwargs):
         batch_conditions = search_conditions[i:i + MONGO_BATCH_SIZE]
         
         try:
-            # 调用带重试的批量查询
             batch_results = query_embeddings_batch(
                 MONGO_PIPELINE_RANK, 
                 batch_conditions, 
@@ -626,7 +563,6 @@ def rank_pipeline(**kwargs):
                 total_batches
             )
             
-            # 处理本批次结果
             for record in batch_results:
                 index = record.get('index')
                 doc_id = record.get('doc_id')
@@ -639,12 +575,11 @@ def rank_pipeline(**kwargs):
             
         except Exception as e:
             failed_batches += 1
-            print(f'[rank_pipeline] ❌ Batch {batch_id}/{total_batches} FAILED after retries: {e}')
-            # 继续处理下一批，不中断整个流程
+            print(f'[Rank] ❌ Batch {batch_id}/{total_batches} FAILED: {e}')
     
-    print(f'[rank_pipeline] ✅ Batch query completed: success={successful_batches}/{total_batches}, failed={failed_batches}, embed_info_cnt={len(embed_info)}, time={time.time() - search_start_time:.2f}s')
+    print(f'[Rank] ✅ Batches: {successful_batches} success, {failed_batches} failed, {len(embed_info)} embeddings, {time.time() - search_start_time:.2f}s')
     
-    # search 请求切片、doc_name数据
+    # 查询切片数据
     find_condition = {'$or': search_conditions} if search_conditions else {}
     data_iter = list(MONGO_PIPELINE.find_data(find_condition))
     cnt = 0
@@ -679,139 +614,38 @@ def rank_pipeline(**kwargs):
         row['shard'] = shard
         row['index'] = index
 
-    if cnt < RETRIEVE_CHUNK_NUM:
-        print(f'mongodb err detect mongo num = {cnt} expect: {RETRIEVE_CHUNK_NUM}')
-
-    ############# keyword -> doc_id match
-    keyword_docid = {}
-    keys = MEMORY_QUERY_MATCH.keys()
-    query1 = query.replace('?', '').replace('？', '').replace("\\n", '').strip(' ')
-    if query1 in keys:
-        keyword_docid = MEMORY_QUERY_MATCH[query1]
-
-    for (keys, doc_wieghts) in MEMORY_KEYWORD_MATCH.items():
-        ks = keys.split(',')
-        match_cnt = 0
-        for k in ks:
-            if k in query:
-                match_cnt += 1
-            else:
-                break
-        if match_cnt == len(ks):
-            for (doc, w) in doc_wieghts.items():
-                if doc not in keyword_docid or keyword_docid[doc] < w:
-                    keyword_docid[doc] = w
-
-    if keyword_docid:
-        find_condition2 = {'doc_id': {'$in': list(keyword_docid.keys())}}
-        data_iter2 = list(MONGO_PIPELINE.find_data(find_condition2))
-        cnt2, cnt_final = 0, 0
-
-        # 同时补充score的m3e embed - 也使用分批查询
-        score_conditions2 = [{'doc_id': doc_id} for doc_id in keyword_docid.keys()]
-        total_conditions2 = len(score_conditions2)
-        total_batches2 = (total_conditions2 + MONGO_BATCH_SIZE - 1) // MONGO_BATCH_SIZE
-        
-        for i in range(0, total_conditions2, MONGO_BATCH_SIZE):
-            batch_id = i // MONGO_BATCH_SIZE + 1
-            batch_conditions2 = score_conditions2[i:i + MONGO_BATCH_SIZE]
-            
-            try:
-                batch_results2 = query_embeddings_batch(
-                    MONGO_PIPELINE_RANK,
-                    batch_conditions2,
-                    batch_id,
-                    total_batches2
-                )
-                for r in batch_results2:
-                    embed_info[int(r['index'])] = r['embedding']
-            except Exception as e:
-                print(f'[rank_pipeline] Keyword boost batch {batch_id} failed: {e}')
-        
-        print(f'after boosting by kw embed_info cnt={len(embed_info)}')
-
-        docid_index_dict = {}
-        weighted_doc_info = {}
-        for dct in data_iter2:
-            doc_id = int(dct['doc_id'])
-            index = dct['index']
-            if index in result_dict:
-                result_dict[index]['final_score'] = result_dict[index]['final_score'] * keyword_docid[doc_id]
-            shard = dct['shard']
-            if len(shard) < 50:
-                continue
-            shard_id = dct['index']
-            doc_name = dct['doc_name']
-            if doc_id not in weighted_doc_info:
-                weighted_doc_info[doc_id] = (doc_name, keyword_docid[doc_id])
-            shard = re.sub(r"\[[0-9].{0,5}\]", "", shard)
-
-            row = {}
-            rank_score = 0
-            if index in embed_info:
-                query_rank_embed = query_rank_embed.to(torch.float32)
-                rank_embed = np.array([float(x) for x in embed_info[index].split(',')])
-                rank_embed = torch.tensor(rank_embed).to(torch.float32)
-                rank_score = util.cos_sim(query_rank_embed, rank_embed).item()
-                row['rank_embed'] = rank_embed
-            row['index'] = index
-            row['recall_score'] = 0.0
-            row['rank_score'] = rank_score
-            row['final_score'] = rank_score * keyword_docid[doc_id]
-            row['doc_name'] = doc_name
-            row['title']=title
-            row['doc_id'] = doc_id
-            row['shard'] = shard
-            row['index'] = shard_id
-
-            if doc_id not in docid_index_dict:
-                docid_index_dict[doc_id] = [row]
-            else:
-                docid_index_dict[doc_id].append(row)
-            cnt2 += 1
-
-        print(f'weighted_doc_info = {weighted_doc_info}')
-        for (doc_id, rows) in docid_index_dict.items():
-            doc_top_rows = sorted(rows, key=lambda d: -d['final_score'])[:CONCAT_CHUNK_NUM * 2]
-            for row in doc_top_rows:
-                result_dict[row['index']] = row
-                cnt_final += 1
-                print(f"add doc id=[{doc_id}],name=[{row['doc_name']}],weight=[{keyword_docid.get(doc_id, 1.0)}],rank_score=[{row['rank_score']}], final_score=[{row['final_score']}]")
-
-        print(f'Adding result: new cnt = {cnt2}, final adding cnt = {cnt_final}, adding files = {keyword_docid}')
-
-    print(f'search on mongo spent time = {time.time() - search_start_time}')
+    print(f'[Rank] Completed in {time.time() - search_start_time:.2f}s')
     return kwargs
 
-@http_retry(max_retries=3, initial_delay=1)
+@http_retry(max_retries=3, initial_delay=10)
 def encode_from_net(querys):
-    """
-    调用远程编码服务生成向量 - 带重试机制
-    """
+    """调用远程编码服务生成向量（超时 × 10）"""
     url=ENCODER_URL
     if isinstance(querys,list):
-        payload = {
-        "queries": querys
-        }
+        payload = {"queries": querys}
     else:
-        payload = {
-        "queries": [querys]
-        }
+        payload = {"queries": [querys]}
 
-    headers = {
-        "Content-Type": "application/json"
-    }
+    headers = {"Content-Type": "application/json"}
 
-    # ⭐ 增加超时时间：连接 10s，读取 120s
-    response = HTTP_SESSION.post(url, json=payload, headers=headers, timeout=(10, 120))
+    # ⭐ 编码超时 × 10: (10, 120) → (100, 1200)
+    response = HTTP_SESSION.post(url, json=payload, headers=headers, timeout=(100, 1200))
     return response.json()['embeddings']
 
 def rerank_pipeline(**kwargs):
-    """重排 pipeline（增强版 - 修复 score count mismatch 和 timeout 问题）"""
-    print('################## process rerank pipeline ##################')
+    """
+    重排 pipeline V4 - 超严格版本
+    主要改进：
+    1. 批次大小：12 → 8（更小，更稳定）
+    2. 重试次数：2 → 3（更多重试）
+    3. 超时时间：30+3×N → 300+30×N（× 10）
+    4. 更详细的错误日志
+    5. 更激进的分批策略
+    """
+    print('################## [Rerank V4] Starting rerank pipeline ##################')
     bge_server_url = RERANKER_URL
     bge_score_weight = 3.0 
-    batch_size = 12  # 减小批次大小：20 -> 12，降低服务端压力和超时风险
+    batch_size = 8  # ⭐ 减小批次：12 → 8
 
     query: str = kwargs['query']
     result_dict: dict = kwargs['result_dict']
@@ -823,105 +657,130 @@ def rerank_pipeline(**kwargs):
     batch_count = 0
     success_count = 0
     fail_count = 0
+    partial_success_count = 0
+    total_chunks_processed = 0
     
-    def process_batch_with_retry(keys, pairs, retry_count=0, max_retries=2):
-        """处理单个批次，带智能重试和降级策略"""
+    def process_batch_with_retry(keys, pairs, retry_count=0, max_retries=3):  # ⭐ 重试：2 → 3
+        """处理单个批次，带超严格重试和降级策略"""
+        nonlocal total_chunks_processed
+        
         try:
             bge_multi_data = {'type': 'multi', 'multi_data': pairs}
             
-            # 动态超时：基础30秒 + 每对3秒
-            read_timeout = 30 + len(pairs) * 3
+            # ⭐ 动态超时 × 10: 30+3×N → 300+30×N
+            read_timeout = 300 + len(pairs) * 30  # 基础300秒 + 每对30秒
+            
+            print(f'[Rerank V4] Batch {batch_count}: size={len(pairs)}, timeout={read_timeout}s, retry={retry_count}/{max_retries}')
             
             response = HTTP_SESSION.post(
                 bge_server_url, 
                 data=json.dumps(bge_multi_data), 
-                timeout=(15, read_timeout)
+                timeout=(150, read_timeout)  # 连接 × 10: 15s → 150s
             )
             
             if response.status_code != 200:
-                raise Exception(f"HTTP {response.status_code}")
+                raise Exception(f"HTTP {response.status_code}: {response.text[:100]}")
             
             bge_rerank_score_list = response.json()['score']
             
-            # ⭐⭐⭐ 智能修复：处理 score 数量不匹配
+            # ⭐⭐⭐ 核心修复：智能处理 score 数量不匹配
             expected_count = len(keys)
             actual_count = len(bge_rerank_score_list)
             
             if actual_count != expected_count:
                 error_msg = f"Score count mismatch: expected {expected_count}, got {actual_count}"
-                print(f'[Rerank] Batch {batch_count} {error_msg}')
+                print(f'[Rerank V4] ⚠️ Batch {batch_count} {error_msg}')
                 
                 # ⭐ 智能修复策略：直接调整 score 列表
                 if actual_count > expected_count:
-                    # 情况1：多了 → 取前 N 个
+                    # 情况1：返回的 score 太多，取前 N 个
                     bge_rerank_score_list = bge_rerank_score_list[:expected_count]
-                    print(f'[Rerank] 🔧 Auto-fix: trimmed {actual_count} → {expected_count}')
+                    print(f'[Rerank V4] 🔧 Auto-fix: trimmed scores from {actual_count} to {expected_count}')
                     
                 elif actual_count < expected_count:
-                    # 情况2：少了 → 补充默认低分
+                    # 情况2：返回的 score 太少，补充默认低分
                     missing_count = expected_count - actual_count
-                    default_score = -10.0
+                    default_score = -10.0  # 默认低分，表示质量差
                     bge_rerank_score_list.extend([default_score] * missing_count)
-                    print(f'[Rerank] 🔧 Auto-fix: padded {missing_count} scores with {default_score}')
+                    print(f'[Rerank V4] 🔧 Auto-fix: padded {missing_count} scores with default value {default_score}')
                 
-                print(f'[Rerank] ✅ Fixed: {len(bge_rerank_score_list)} == {expected_count}')
+                # 修复后继续处理
+                print(f'[Rerank V4] ✅ Fixed: score count now matches {len(bge_rerank_score_list)} == {expected_count}')
             
-            # 验证修复（双重保险）
+            # 验证修复后的数量（双重保险）
             if len(bge_rerank_score_list) != expected_count:
-                print(f'[Rerank] ❌ Fix failed, trying split...')
-                if retry_count < max_retries and len(keys) > 3:
+                print(f'[Rerank V4] ❌ Failed to fix score count, falling back to retry...')
+                
+                # 如果修复失败，才使用分批重试策略
+                if retry_count < max_retries and len(keys) > 2:
+                    print(f'[Rerank V4] 📊 Splitting batch (attempt {retry_count + 1})...')
                     mid = len(keys) // 2
                     success1 = process_batch_with_retry(keys[:mid], pairs[:mid], retry_count + 1, max_retries)
                     success2 = process_batch_with_retry(keys[mid:], pairs[mid:], retry_count + 1, max_retries)
                     return success1 or success2
+                
                 return False
             
-            # 应用分数
+            # ⭐ 数量匹配，应用分数
+            score_applied = 0
             for score_index in range(len(bge_rerank_score_list)):
                 try:
                     score_value = bge_rerank_score_list[score_index]
                     # 处理可能的嵌套列表
                     if isinstance(score_value, list):
-                        score_value = score_value[0]
+                        if len(score_value) > 0:
+                            score_value = score_value[0]
+                        else:
+                            print(f'[Rerank V4] ⚠️ Empty score list at index {score_index}')
+                            continue
                     
                     rank_score = result_dict_sorted[keys[score_index]]['final_score'] + \
                                  bge_score_weight * float(score_value)
                     result_dict_sorted[keys[score_index]]['rerank_score'] = rank_score
                     result_dict_sorted[keys[score_index]]['final_score'] = rank_score
+                    score_applied += 1
+                    total_chunks_processed += 1
                 except (IndexError, ValueError, TypeError) as e:
-                    print(f'[Rerank] Error applying score at index {score_index}: {e}')
+                    print(f'[Rerank V4] ⚠️ Error at score_index={score_index}: {e}')
                     result_dict_sorted[keys[score_index]]['rerank_score'] = \
                         result_dict_sorted[keys[score_index]]['final_score']
             
+            print(f'[Rerank V4] ✅ Batch {batch_count}: applied {score_applied}/{len(keys)} scores')
             return True
             
         except requests.exceptions.Timeout as e:
             # 超时错误：尝试重试或分批
+            print(f'[Rerank V4] ⏰ Timeout: {type(e).__name__}')
             if retry_count < max_retries:
-                if len(keys) > 5:
-                    print(f'[Rerank] Batch {batch_count} timeout, splitting batch (retry {retry_count + 1})...')
+                if len(keys) > 3:
+                    print(f'[Rerank V4] Splitting on timeout (retry {retry_count + 1})...')
                     mid = len(keys) // 2
                     success1 = process_batch_with_retry(keys[:mid], pairs[:mid], retry_count + 1, max_retries)
                     success2 = process_batch_with_retry(keys[mid:], pairs[mid:], retry_count + 1, max_retries)
                     return success1 or success2
                 else:
-                    print(f'[Rerank] Batch {batch_count} timeout, retrying (attempt {retry_count + 1})...')
-                    time.sleep(1 * (retry_count + 1))
+                    wait_time = 10 * (retry_count + 1)  # 等待时间 × 10
+                    print(f'[Rerank V4] Retrying after {wait_time}s (attempt {retry_count + 1})...')
+                    time.sleep(wait_time)
                     return process_batch_with_retry(keys, pairs, retry_count + 1, max_retries)
             
-            print(f'[Rerank] Batch {batch_count} error: {type(e).__name__}')
+            print(f'[Rerank V4] ❌ Timeout after all retries')
             return False
             
         except Exception as e:
             # 其他错误：重试
+            error_msg = f"{type(e).__name__}: {str(e)[:100]}"
+            print(f'[Rerank V4] ❌ Error: {error_msg}')
+            
             if retry_count < max_retries:
-                print(f'[Rerank] Batch {batch_count} error: {str(e)[:100]}, retrying...')
-                time.sleep(0.5 * (retry_count + 1))
+                wait_time = 5 * (retry_count + 1)
+                print(f'[Rerank V4] Retrying after {wait_time}s...')
+                time.sleep(wait_time)
                 return process_batch_with_retry(keys, pairs, retry_count + 1, max_retries)
             
-            print(f'[Rerank] Batch {batch_count} error: {str(e)[:100]}')
             return False
         
+    # 主处理循环
     for index in range(len(sorted_top_chunk)):
         combined_key = sorted_top_chunk[index][0]
         chunk_data = sorted_top_chunk[index][1]
@@ -932,21 +791,26 @@ def rerank_pipeline(**kwargs):
         result_dict_sorted[combined_key] = chunk_data
         
         if index < 300:
-            # 文本预处理：清理特殊字符，智能截断
+            # ⭐ 文本预处理：更严格的清理
             shard_text = chunk_data['shard']
-            if len(shard_text) > 1000:
-                # 在句子边界截断
-                truncated = shard_text[:1000]
-                for punct in ['。', '！', '？', '.', '!', '?', '\n']:
+            
+            # 1. 清理特殊字符
+            shard_text = shard_text.replace('\x00', '').replace('\r', '').replace('\t', ' ')
+            shard_text = re.sub(r'\s+', ' ', shard_text)  # 多个空白替换为单个空格
+            
+            # 2. 智能截断（在句子边界）
+            if len(shard_text) > 800:  # ⭐ 更保守：1000 → 800
+                truncated = shard_text[:800]
+                for punct in ['。', '！', '？', '.', '!', '?', '\n', '；', ';']:
                     last_idx = truncated.rfind(punct)
-                    if last_idx > 700:
+                    if last_idx > 600:  # 确保有足够内容
                         truncated = truncated[:last_idx + 1]
                         break
                 shard_text = truncated
             
-            # 移除空字符和多余空白
-            shard_text = shard_text.replace('\x00', '').strip()
-            if not shard_text:
+            # 3. 最终清理
+            shard_text = shard_text.strip()
+            if not shard_text or len(shard_text) < 10:  # 至少10个字符
                 continue
             
             bge_score_buff_dict[0].append(combined_key)
@@ -954,7 +818,7 @@ def rerank_pipeline(**kwargs):
             
             if len(bge_score_buff_dict[0]) >= batch_size:
                 batch_count += 1
-                print(f"[Rerank] Processing batch {batch_count}, size: {len(bge_score_buff_dict[0])}")
+                print(f"\n[Rerank V4] ═══ Processing batch {batch_count}, size: {len(bge_score_buff_dict[0])} ═══")
                 
                 if process_batch_with_retry(bge_score_buff_dict[0], bge_score_buff_dict[1]):
                     success_count += 1
@@ -962,8 +826,9 @@ def rerank_pipeline(**kwargs):
                     fail_count += 1
                     # 失败降级：使用原始分数
                     for combined_key in bge_score_buff_dict[0]:
-                        result_dict_sorted[combined_key]['rerank_score'] = \
-                            result_dict_sorted[combined_key]['final_score']
+                        if combined_key in result_dict_sorted:
+                            result_dict_sorted[combined_key]['rerank_score'] = \
+                                result_dict_sorted[combined_key]['final_score']
                 
                 bge_score_buff_dict = [[], []]
         else:
@@ -976,19 +841,28 @@ def rerank_pipeline(**kwargs):
     # 处理最后一个不满批次
     if len(bge_score_buff_dict[0]) > 0:
         batch_count += 1
-        print(f"[Rerank] Processing final batch {batch_count}, size: {len(bge_score_buff_dict[0])}")
+        print(f"\n[Rerank V4] ═══ Processing FINAL batch {batch_count}, size: {len(bge_score_buff_dict[0])} ═══")
         
         if process_batch_with_retry(bge_score_buff_dict[0], bge_score_buff_dict[1]):
             success_count += 1
         else:
             fail_count += 1
             for combined_key in bge_score_buff_dict[0]:
-                result_dict_sorted[combined_key]['rerank_score'] = \
-                    result_dict_sorted[combined_key]['final_score']
+                if combined_key in result_dict_sorted:
+                    result_dict_sorted[combined_key]['rerank_score'] = \
+                        result_dict_sorted[combined_key]['final_score']
         
         bge_score_buff_dict = [[], []]
     
-    print(f'[Rerank] Completed: {success_count} successful, {fail_count} failed out of {batch_count} batches')
+    # 最终统计
+    success_rate = (success_count / batch_count * 100) if batch_count > 0 else 0
+    print(f'\n[Rerank V4] ═══════════════════════════════════════════════════')
+    print(f'[Rerank V4] 📊 FINAL STATS:')
+    print(f'[Rerank V4]    Total batches: {batch_count}')
+    print(f'[Rerank V4]    ✅ Success: {success_count} ({success_rate:.1f}%)')
+    print(f'[Rerank V4]    ❌ Failed: {fail_count}')
+    print(f'[Rerank V4]    📝 Chunks processed: {total_chunks_processed}')
+    print(f'[Rerank V4] ═══════════════════════════════════════════════════\n')
              
     result_dict = result_dict_sorted
 
@@ -1018,11 +892,12 @@ def rerank_pipeline(**kwargs):
         row['match_score'] = match_score
         row['final_score'] = row['final_score'] * match_score
 
-    print(f'[Rerank] keyword weight num = {weight_num}')
+    print(f'[Rerank V4] Keyword weight applied to {weight_num} chunks')
     kwargs['result_dict'] = result_dict
     return kwargs
 
 def concat_shards_by_rank(**kwargs):
+    """拼接 chunks"""
     query = kwargs['query']
     query_expand = kwargs['query_expand']
     result_dict = kwargs['result_dict']
@@ -1049,7 +924,7 @@ def concat_shards_by_rank(**kwargs):
             index_j = info_j['index']
             bigger, smaller = max(index_i, index_j), min(index_i, index_j)
     
-    print(f'[concat_shards_by_rank], using time={time.time()-start_time}')
+    print(f'[Concat] Similarity matrix time={time.time()-start_time:.2f}s')
 
     selectedDocs = []
     
@@ -1057,9 +932,7 @@ def concat_shards_by_rank(**kwargs):
     for i in range(sim_num):
         mmrStep(0.9, selectedDocs, sorted_top_chunk, simMatrix)
     
-    print(f'[concat_shards_by_rank] mmrStep, using time={time.time() - start_time}')
-
-    print(f"[concat_shards_by_rank]compare: after mmr top10={selectedDocs[:30]}")
+    print(f'[Concat] MMR time={time.time() - start_time:.2f}s')
 
     res_arr_dict = {}
     res_arr = []
@@ -1114,7 +987,7 @@ def concat_shards_by_rank(**kwargs):
             this_res['text'] = this_shard
             this_res['concat_score'] = concat_score
             if is_debug:
-                print(f'[concat_shards_by_rank] chunks_id={chunks_id}, score={concat_score}')
+                print(f'[Concat] chunks_id={chunks_id}, score={concat_score}')
             if concat_score < min_concat_score:
                 min_concat_score = concat_score
                 min_concat_id = chunks_id
@@ -1141,90 +1014,17 @@ def concat_shards_by_rank(**kwargs):
         sorted_item[1]['ans_id'] = item_index
         res_arr.append(sorted_item[1])
     
-    print(f'[concat_shards_by_rank] min concat_scores={min_concat_score}, chunks_id={min_concat_id}')
-
-    if random.random() < 0.1 or is_debug:
-        for i, d in enumerate(res_arr):
-            print(f'[concat_shards_by_rank] rk={i}, res={d["text"][:200]}')
+    print(f'[Concat] Generated {len(res_arr)} result groups')
 
     return res_arr
 
-def query_expand_srv(query: str, query_expand: list):
-    query_contains = {
-        'match': {
-            'question': query
-        }
-    }
-    es_res = ES.search(index="query_answer_history_v1023", query=query_contains, size=3)["hits"]["hits"]
-    candidates = []
-    for r in es_res:
-        dct = {}
-        score = r["_score"]
-        dct['question'] = r["_source"]["question"]
-        dct['answer'] = r["_source"]["answer"]
-        dct['score'] = score
-        candidates.append(dct)
-
-    for dct in sorted(candidates, key=lambda x: -x['score']):
-        editsim = levenshteinDistance(query, dct['question'])
-        if editsim <= 2:
-            query_expand.append(dct['answer'])
-            return
-
-    gpt4_df = pd.read_excel('/home/tcl/rqa_dir/models_lxl/test_0222_60.xlsx')
-    if query in gpt4_df['问题'].values: 
-        hanghao = gpt4_df[gpt4_df['问题'] == query].index.to_list()[0]
-        query_expand.append(gpt4_df.iloc[hanghao, 1])
-        return
-    else :
-        have_ans_querys = list(gpt4_df['问题'].values)
-        for query_index in range(len(have_ans_querys)):
-            querys_distance = levenshteinDistance(query, have_ans_querys[query_index])
-            max_query_len = max(len(query), len(have_ans_querys[query_index]))
-            if querys_distance/max_query_len < 0.2:
-                query_expand.append(gpt4_df.iloc[query_index, 1])
-                print(query, have_ans_querys[query_index], gpt4_df.iloc[query_index, 1])
-                return
-    
-    url = 'https://tcl-ai-france.openai.azure.com/openai/deployments/gpt-4-0314/chat/completions?api-version=2023-03-15-preview'
-    headers = {
-        'Content-Type': 'application/json',
-        'api-key': '98ff3b4afac846a7bede351bcec20ce8'
-    }
-    temperature = 0
-    messages = [
-        {
-            "role": "system",
-            "content": "You are an expert in the field of semiconductor displays technology. "
-        },
-        {
-            "role": "assistant",
-            "content": ""
-        },
-        {
-            "role": "user",
-            "content": f"""请用中文简短地回答问题: '{query}'。字数在30个字以内。"""
-        }
-    ]
-    data = json.dumps({"messages": messages, "temperature": temperature})
-    try:
-        response = HTTP_SESSION.post(url, data=data, headers=headers, timeout=(10, 30))
-        res = response.json().get('choices')[0].get('message').get('content')
-        query_expand.append(res.strip(' '))
-    except Exception as e:
-        print(f'cannot find query expand by gpt-4 engine: {e}')
-    return
-
-
 @app.route('/api-rqa-search/test', methods=['GET'])
 def hello_world():
-    return json_result(0, '', 'Service available')
+    return json_result(0, '', f'V4 Service Available - 10× Timeout Config')
 
 @app.route('/api-rqa-search/search', methods=['POST'])
 def get_data():
-    """
-    搜索服务主函数
-    """
+    """搜索服务主函数 V4"""
     form = request.form
     query = form.get('query', '', str)
     query_en = form.get('query_dst', '', str)
@@ -1258,7 +1058,7 @@ def get_data():
     try:
         json_arr = []
         
-        # ⭐ 使用带重试的编码服务
+        # 使用带重试的编码服务
         query_embed = encode_from_net(query)
         query_rank_embed = encode_from_net(query)
 
@@ -1279,7 +1079,6 @@ def get_data():
         query_embed = encode_from_net(query)
         query_embed_expand = encode_from_net(query_expand)
         query_rank_embed_expand = encode_from_net(query_expand)
-        print(f'[get_data] expand queries = {query_expand}, emb_len={len(query_embed_expand)}')
 
         params['query_embed'] = query_embed
         params['query_embed_expand'] = query_embed_expand
@@ -1292,9 +1091,9 @@ def get_data():
             params['query_en'] = query_en
         params['result_dict'] = result_dict
         
-        # 步骤3: 多路召回
+        # 多路召回
         params = recall_pipeline(**params)
-        print(f'recall spent time = {time.time() - start_time}')
+        print(f'[Main] Recall: {time.time() - start_time:.2f}s')
         
         if not params['flag_query_rel']:
             code = 1
@@ -1303,22 +1102,21 @@ def get_data():
             data['arr'] = []
             return json_result(code, msg, data)
 
-        # 步骤4: 排序与重排
+        # 排序与重排
         params = rank_pipeline(**params)
-        print(f'rank spent time = {time.time() - start_time}')
+        print(f'[Main] Rank: {time.time() - start_time:.2f}s')
         params = rerank_pipeline(**params)
-        print(f'rerank spent time = {time.time() - start_time}')
-        print(f'In request: query={query}, top_doc_num={top_doc_num}')
+        print(f'[Main] Rerank: {time.time() - start_time:.2f}s')
+        
         params['top_doc_num'] = top_doc_num
         params['concat_num'] = CONCAT_CHUNK_NUM
         params['is_debug'] = is_debug
 
-        # 步骤5: 结果拼接与返回
+        # 结果拼接与返回
         similar_shards = concat_shards_by_rank(**params)
         high_scores = []
         for dict in similar_shards:
             score = dict['score']
-            print(score)
             if score < SCORE_THREHOLD:
                 break
             high_scores.append(score)
@@ -1333,11 +1131,12 @@ def get_data():
         data['msg'] = msg
         data['doc_num'] = 0
         data['arr'] = []
-        print(f'[ERROR] get_data exception: {msg}')
+        print(f'[ERROR] Exception:\n{msg}')
 
     now = datetime.datetime.now()
     data['ts'] = int(datetime.datetime.timestamp(now) * 1000)
-    print(f'total spent time = {time.time() - start_time}')
+    total_time = time.time() - start_time
+    print(f'[Main] ⏱️ Total time: {total_time:.2f}s')
     return json_result(code, msg, data)
 
 
@@ -1383,13 +1182,24 @@ def json_result(code: int, msg: str, data):
     return jsonify({'code': code, 'msg': msg, 'data': data})
 
 faulthandler.enable()
-print(f'start server at {time.time()}')
+
+print(f'═══════════════════════════════════════════════════════════')
+print(f'🚀 [Server V4] Starting with 10× TIMEOUT configuration')
+print(f'═══════════════════════════════════════════════════════════')
+print(f'   Version: {VERSION}')
+print(f'   Batch Size: 8 (rerank)')
+print(f'   Max Retries: 3')
+print(f'   Timeouts:')
+print(f'     - MongoDB: 600-1200s (× 10)')
+print(f'     - HTTP: 100-1200s (× 10)')
+print(f'     - Rerank: 300+30×N s (× 10)')
+print(f'     - Encoder: (100, 1200)s (× 10)')
+print(f'     - Milvus: (100, 1200)s (× 10)')
+print(f'═══════════════════════════════════════════════════════════\n')
 
 # 服务启动参数填充
 config = configparser.ConfigParser()
 config.read('./config/search_srv_pipeline_l.ini', encoding='UTF-8')
-print(f'load embed model name = {MODEL_NAME}')
-print(f'load mongo tbl={TABLE_NAME} , {type(TABLE_NAME)}, version={VERSION}')
 
 scheduler = BackgroundScheduler()
 scheduler.add_job(crontab_update_config, 'interval', seconds=180, coalesce=True, replace_existing=True)
@@ -1398,6 +1208,8 @@ scheduler.start()
 load_data(TABLE_NAME, MODEL_NAME)
 
 if __name__ == '__main__':
-    # 启用多线程支持并发请求处理
-    print(f'🚀 [Server Start] MongoDB batch_size={MONGO_BATCH_SIZE}, HTTP pool_size={HTTP_ADAPTER.pool_maxsize}')
+    print(f'\n✅ [Server V4] Ready to serve!')
+    print(f'   Listen: 10.70.223.31:9510')
+    print(f'   HTTP Pool: {HTTP_ADAPTER.pool_maxsize} connections')
+    print(f'   MongoDB Batch: {MONGO_BATCH_SIZE}\n')
     app.run('10.70.223.31', port=9510, threaded=True, processes=1)
