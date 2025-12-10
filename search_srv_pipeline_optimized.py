@@ -9,8 +9,9 @@
 - v2.1 (2025-12-10 14:30) 添加详细日志，修复统计问题
 - v2.2 (2025-12-10 16:00) 增强错误处理，强制打印异常信息
 - v2.3 (2025-12-10 17:00) 严格验证编码结果，优化并发控制
+- v2.4 (2025-12-10 18:00) 完善请求完成日志，优化阶段统计
 
-当前版本：v2.3
+当前版本：v2.4
 
 优化内容：
 1. ✅ 自适应超时策略（高并发场景下缩短超时）
@@ -24,7 +25,7 @@
 9. ✅ 添加请求过载保护（限流）
 10. ✅ 详细的阶段日志（便于诊断瓶颈）
 
-最后修改时间：2025-12-10 17:00
+最后修改时间：2025-12-10 18:00
 """
 
 import configparser
@@ -248,7 +249,10 @@ class RequestMonitor:
                     req['stages'][stage] = time.time()
     
     def end_stage(self, req_id, stage):
-        """结束一个阶段，记录耗时"""
+        """
+        结束一个阶段，记录耗时
+        v2.3: 即使请求已经不在active_requests中也尝试记录（使用缓存）
+        """
         with self.lock:
             if req_id in self.active_requests:
                 req = self.active_requests[req_id]
@@ -259,7 +263,7 @@ class RequestMonitor:
                     if stage not in self.stats['stage_times']:
                         self.stats['stage_times'][stage] = []
                     
-                    if isinstance(duration, (int, float)):
+                    if isinstance(duration, (int, float)) and duration >= 0:
                         self.stats['stage_times'][stage].append(float(duration))
                     
                     if len(self.stats['stage_times'][stage]) > 100:
@@ -629,7 +633,7 @@ PROFESSIONAL_DICT = set()
 
 MONGO_URL = 'mongodb://root:example@10.70.223.31:27017'
 MONGO_DB = 'rqa'
-VERSION = 'v2.3_20251210_1700'  # v2.3 - 2025-12-10 17:00 - 增强错误处理和验证
+VERSION = 'v2.4_20251210_1800'  # v2.4 - 2025-12-10 18:00 - 完善日志和统计
 
 MONGO_PIPELINE = None
 MONGO_PIPELINE_RANK = None
@@ -1703,8 +1707,18 @@ def get_data():
         data['ts'] = int(time.time() * 1000)
         data['process_time'] = time.time() - start_time
         
-        print(f'[Request {req_id}] Completed in {data["process_time"]:.2f}s, '
-              f'code={code}, results: {data.get("doc_num", 0)}')
+        # ✅ 根据code打印不同的状态
+        if code == 0:
+            status_emoji = "✅"
+        elif code == 1:
+            status_emoji = "⚠️"
+        elif code == -2:
+            status_emoji = "⏱️"
+        else:
+            status_emoji = "❌"
+        
+        print(f'[Request {req_id}] {status_emoji} Completed in {data["process_time"]:.2f}s, '
+              f'code={code}, msg="{msg[:50]}", results: {data.get("doc_num", 0)}')
         
         return json_result(code, msg, data)
         
