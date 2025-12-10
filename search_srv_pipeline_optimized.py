@@ -11,8 +11,9 @@
 - v2.3 (2025-12-10 17:00) 严格验证编码结果，优化并发控制
 - v2.4 (2025-12-10 18:00) 完善请求完成日志，优化阶段统计
 - v2.5 (2025-12-10 19:00) 串行化重排阶段（彻底解决44秒超时问题）
+- v2.6 (2025-12-10 20:00) 添加防御性类型检查（修复append错误）
 
-当前版本：v2.5 - 重排串行化
+当前版本：v2.6 - 串行化+防御性检查
 
 优化内容：
 1. ✅ 自适应超时策略（高并发场景下缩短超时）
@@ -26,7 +27,7 @@
 9. ✅ 添加请求过载保护（限流）
 10. ✅ 详细的阶段日志（便于诊断瓶颈）
 
-最后修改时间：2025-12-10 19:00
+最后修改时间：2025-12-10 20:00
 """
 
 import configparser
@@ -637,7 +638,7 @@ PROFESSIONAL_DICT = set()
 
 MONGO_URL = 'mongodb://root:example@10.70.223.31:27017'
 MONGO_DB = 'rqa'
-VERSION = 'v2.5_20251210_1900'  # v2.5 - 2025-12-10 19:00 - 串行化重排
+VERSION = 'v2.6_20251210_2000'  # v2.6 - 2025-12-10 20:00 - 防御性检查
 
 MONGO_PIPELINE = None
 MONGO_PIPELINE_RANK = None
@@ -1591,6 +1592,12 @@ def get_data():
                     raise Exception("Recall failed")
                 
                 params.update(recall_result)
+                
+                # v2.6: 防御性检查 - 确保result_dict是字典
+                if not isinstance(params.get('result_dict'), dict):
+                    print(f'[Request {req_id}] ⚠️  Warning: result_dict is {type(params.get("result_dict"))}, resetting to empty dict')
+                    params['result_dict'] = {}
+                
                 recall_count = len(params.get('result_dict', {}))
                 print(f'[Request {req_id}] ✅ Recall completed in {time.time()-recall_start:.1f}s, found {recall_count} chunks')
                 MONITOR.end_stage(req_id, 'recall')
@@ -1661,6 +1668,11 @@ def get_data():
                     default=[],
                     operation_name="Concatenation"
                 )
+                
+                # v2.6: 防御性检查 - 确保similar_shards是列表
+                if not isinstance(similar_shards, list):
+                    print(f'[Request {req_id}] ⚠️  Warning: similar_shards is {type(similar_shards)}, converting to list')
+                    similar_shards = []
                 
                 print(f'[Request {req_id}] ✅ Concatenation completed in {time.time()-concat_start:.1f}s, got {len(similar_shards)} results')
                 MONITOR.end_stage(req_id, 'concatenating')
