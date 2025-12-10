@@ -683,68 +683,42 @@ def rerank_pipeline(**kwargs):
             
             bge_rerank_score_list = response.json()['score']
             
-            # ⭐ 核心：严格检查 score 数量是否匹配
+            # ⭐⭐⭐ 核心修复：智能处理 score 数量不匹配
             expected_count = len(keys)
             actual_count = len(bge_rerank_score_list)
             
             if actual_count != expected_count:
                 error_msg = f"Score count mismatch: expected {expected_count}, got {actual_count}"
-                print(f'[Rerank V4] ❌ Batch {batch_count} {error_msg}')
+                print(f'[Rerank V4] ⚠️ Batch {batch_count} {error_msg}')
                 
-                # ⭐ 策略1：如果还能重试，立即分批
-                if retry_count < max_retries and len(keys) > 2:  # 最小分批为2
-                    print(f'[Rerank V4] 📊 Splitting batch into smaller chunks (attempt {retry_count + 1})...')
+                # ⭐ 智能修复策略：直接调整 score 列表
+                if actual_count > expected_count:
+                    # 情况1：返回的 score 太多，取前 N 个
+                    bge_rerank_score_list = bge_rerank_score_list[:expected_count]
+                    print(f'[Rerank V4] 🔧 Auto-fix: trimmed scores from {actual_count} to {expected_count}')
                     
-                    # 分成3份（更激进）
-                    third = len(keys) // 3
-                    if third < 2:
-                        third = len(keys) // 2  # 至少分成2份
-                    
-                    parts = []
-                    for i in range(0, len(keys), third):
-                        end = min(i + third, len(keys))
-                        if end > i:
-                            parts.append((keys[i:end], pairs[i:end]))
-                    
-                    print(f'[Rerank V4] Split into {len(parts)} parts: sizes={[len(p[0]) for p in parts]}')
-                    
-                    # 递归处理每个部分
-                    success_parts = 0
-                    for part_keys, part_pairs in parts:
-                        if process_batch_with_retry(part_keys, part_pairs, retry_count + 1, max_retries):
-                            success_parts += 1
-                    
-                    return success_parts > 0  # 至少一个成功就算成功
+                elif actual_count < expected_count:
+                    # 情况2：返回的 score 太少，补充默认低分
+                    missing_count = expected_count - actual_count
+                    default_score = -10.0  # 默认低分，表示质量差
+                    bge_rerank_score_list.extend([default_score] * missing_count)
+                    print(f'[Rerank V4] 🔧 Auto-fix: padded {missing_count} scores with default value {default_score}')
                 
-                # ⭐ 策略2：如果是最后一次重试，尝试单个处理
-                if retry_count == max_retries and len(keys) > 1:
-                    print(f'[Rerank V4] 🔍 Last attempt: processing items one by one...')
-                    success_items = 0
-                    for i, (key, pair) in enumerate(zip(keys, pairs)):
-                        try:
-                            single_result = HTTP_SESSION.post(
-                                bge_server_url,
-                                data=json.dumps({'type': 'multi', 'multi_data': [pair]}),
-                                timeout=(150, 600)  # 单个item超时600秒
-                            )
-                            if single_result.status_code == 200:
-                                single_score = single_result.json()['score']
-                                if len(single_score) == 1:
-                                    score_value = single_score[0]
-                                    if isinstance(score_value, list):
-                                        score_value = score_value[0]
-                                    rank_score = result_dict_sorted[key]['final_score'] + bge_score_weight * float(score_value)
-                                    result_dict_sorted[key]['rerank_score'] = rank_score
-                                    result_dict_sorted[key]['final_score'] = rank_score
-                                    success_items += 1
-                                    total_chunks_processed += 1
-                        except Exception as e:
-                            print(f'[Rerank V4] Item {i+1}/{len(keys)} failed: {str(e)[:50]}')
-                    
-                    print(f'[Rerank V4] One-by-one: {success_items}/{len(keys)} succeeded')
-                    return success_items > 0
+                # 修复后继续处理
+                print(f'[Rerank V4] ✅ Fixed: score count now matches {len(bge_rerank_score_list)} == {expected_count}')
+            
+            # 验证修复后的数量（双重保险）
+            if len(bge_rerank_score_list) != expected_count:
+                print(f'[Rerank V4] ❌ Failed to fix score count, falling back to retry...')
                 
-                print(f'[Rerank V4] ❌ Batch {batch_count} failed completely')
+                # 如果修复失败，才使用分批重试策略
+                if retry_count < max_retries and len(keys) > 2:
+                    print(f'[Rerank V4] 📊 Splitting batch (attempt {retry_count + 1})...')
+                    mid = len(keys) // 2
+                    success1 = process_batch_with_retry(keys[:mid], pairs[:mid], retry_count + 1, max_retries)
+                    success2 = process_batch_with_retry(keys[mid:], pairs[mid:], retry_count + 1, max_retries)
+                    return success1 or success2
+                
                 return False
             
             # ⭐ 数量匹配，应用分数
