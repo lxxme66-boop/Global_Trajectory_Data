@@ -2,13 +2,29 @@
 # -*- coding: utf-8 -*-
 """
 搜索服务 - 自适应超时版（防卡死优化）+ 修复请求ID冲突
+
+版本历史：
+- v1.0 (2023-09-11) 初始版本
+- v2.0 (2025-12-10 13:00) 修复请求ID冲突（原子计数器）
+- v2.1 (2025-12-10 14:30) 添加详细日志，修复统计问题
+- v2.2 (2025-12-10 16:00) 增强错误处理，强制打印异常信息
+- v2.3 (2025-12-10 17:00) 严格验证编码结果，优化并发控制
+
+当前版本：v2.3
+
 优化内容：
-1. 自适应超时策略（高并发场景下缩短超时）
-2. 强制请求级别超时（防止无限等待）
-3. 修复重排Score count mismatch问题（智能补齐/截断）
-4. 增强并行处理能力
-5. 添加卡死检测和自动恢复
+1. ✅ 自适应超时策略（高并发场景下缩短超时）
+2. ✅ 强制请求级别超时（防止无限等待）
+3. ✅ 修复重排Score count mismatch问题（智能补齐/截断）
+4. ✅ 增强并行处理能力
+5. ✅ 添加卡死检测和自动恢复
 6. ✅ 修复请求ID冲突问题（线程安全的原子计数器）
+7. ✅ 强制打印所有错误信息（不依赖DEBUG_MODE）
+8. ✅ 严格验证编码服务返回结果
+9. ✅ 添加请求过载保护（限流）
+10. ✅ 详细的阶段日志（便于诊断瓶颈）
+
+最后修改时间：2025-12-10 17:00
 """
 
 import configparser
@@ -613,7 +629,7 @@ PROFESSIONAL_DICT = set()
 
 MONGO_URL = 'mongodb://root:example@10.70.223.31:27017'
 MONGO_DB = 'rqa'
-VERSION = '2023091110_adaptive_fixed'
+VERSION = 'v2.3_20251210_1700'  # v2.3 - 2025-12-10 17:00 - 增强错误处理和验证
 
 MONGO_PIPELINE = None
 MONGO_PIPELINE_RANK = None
@@ -754,43 +770,91 @@ def check_query_relevance(query: str) -> bool:
             print(f'[Query Relevance] Error: {e}')
             return True
 
-# ==================== 编码服务（自适应超时） ====================
+# ==================== 编码服务（自适应超时 + 增强错误处理）[v2.3] ====================
 @http_retry
 def encode_from_net_cached(querys):
-    """调用编码服务（带缓存和自适应超时）"""
+    """
+    调用编码服务（带缓存和自适应超时）
+    
+    v2.3 改进：
+    - 添加详细的错误日志
+    - 验证返回结果格式
+    - 缓存有效性检查
+    """
     if isinstance(querys, list):
         cache_key = '|'.join([str(q) for q in querys])
     else:
         cache_key = str(querys)
     
+    # 检查缓存
     cached_result = ENCODE_CACHE.get(cache_key)
     if cached_result is not None:
-        return cached_result
+        # 验证缓存数据有效性
+        if isinstance(cached_result, list) and len(cached_result) > 0:
+            return cached_result
+        else:
+            print(f'⚠️  [Encode] Cached result invalid, fetching new one')
     
     url = ENCODER_URL
     if isinstance(querys, list):
         payload = {"queries": querys}
+        query_count = len(querys)
     else:
         payload = {"queries": [querys]}
+        query_count = 1
 
     headers = {"Content-Type": "application/json"}
     
     try:
         # 自适应超时
         timeout = TIMEOUT_MANAGER.get_timeout('encoding')
+        
         response = HTTP_SESSION.post(
             url, 
             json=payload, 
             headers=headers, 
             timeout=(15, timeout)
         )
-        response.raise_for_status()
-        result = response.json()['embeddings']
         
+        if response.status_code != 200:
+            raise Exception(f"HTTP {response.status_code}: {response.text[:200]}")
+        
+        response.raise_for_status()
+        result_json = response.json()
+        
+        # v2.3: 严格验证返回结果
+        if 'embeddings' not in result_json:
+            raise Exception(f"Response missing 'embeddings' field: {list(result_json.keys())}")
+        
+        result = result_json['embeddings']
+        
+        # 验证结果格式和数量
+        if not isinstance(result, list):
+            raise Exception(f"Invalid result type: {type(result)}")
+        
+        if len(result) == 0:
+            raise Exception(f"Empty embeddings returned for {query_count} queries")
+        
+        if len(result) != query_count:
+            print(f'⚠️  [Encode] Expected {query_count} embeddings, got {len(result)}')
+        
+        # 验证第一个embedding格式
+        if len(result) > 0:
+            if not isinstance(result[0], (list, tuple)) or len(result[0]) == 0:
+                raise Exception(f"Invalid embedding format: type={type(result[0])}, len={len(result[0]) if isinstance(result[0], (list, tuple)) else 'N/A'}")
+        
+        # 缓存有效结果
         ENCODE_CACHE.set(cache_key, result)
         return result
+        
+    except requests.exceptions.Timeout as e:
+        print(f'❌ [Encode] Timeout after {timeout}s: {str(e)[:100]}')
+        raise Exception(f"Encoding service timeout: {str(e)[:100]}")
+    except requests.exceptions.ConnectionError as e:
+        print(f'❌ [Encode] Connection error: {str(e)[:100]}')
+        raise Exception(f"Encoding service connection error: {str(e)[:100]}")
     except Exception as e:
-        print(f'[Encode] Error: {e}')
+        print(f'❌ [Encode] Error: {str(e)[:200]}')
         raise
 
 # ==================== 召回阶段（并行 + 自适应超时） ====================
@@ -1523,9 +1587,14 @@ def get_data():
                 print(f'[Request {req_id}] ✅ Recall completed in {time.time()-recall_start:.1f}s, found {recall_count} chunks')
                 MONITOR.end_stage(req_id, 'recall')
                 
+                # v2.3: 检查召回结果
+                if recall_count == 0:
+                    print(f'[Request {req_id}] ⚠️  No chunks recalled, query might be too specific or irrelevant')
+                    return {'code': 1, 'msg': 'No relevant documents found', 'arr': [], 'doc_num': 0}
+                
                 if not params['flag_query_rel']:
-                    print(f'[Request {req_id}] ⚠️  Query not relevant')
-                    return {'code': 1, 'msg': 'query must be relevant', 'arr': [], 'doc_num': 0}
+                    print(f'[Request {req_id}] ⚠️  Query not relevant (relevance check failed)')
+                    return {'code': 1, 'msg': 'Query not relevant to domain', 'arr': [], 'doc_num': 0}
                 
                 # 阶段3: 排序
                 MONITOR.update_stage(req_id, 'ranking')
@@ -1705,15 +1774,26 @@ def json_result(code: int, msg: str, data):
 # ==================== 主程序 ====================
 faulthandler.enable()
 
-print(f'🚀 [Server] Starting on {SERVER_HOST}:{SERVER_PORT}...')
-print(f'[Config] Workers: {WORKER_COUNT}, BatchSize: {MONGO_BATCH_SIZE}')
-print(f'[Config] Model: {MODEL_NAME}, Version: {VERSION}')
-print(f'[Config] Debug Mode: {DEBUG_MODE}')
-print(f'⏱️  [Timeout] Adaptive strategy enabled')
-print(f'   - Max request timeout: {MAX_REQUEST_TIMEOUT}s (forced)')
-print(f'   - Base timeout: 60s')
-print(f'   - Multiplier: 1.5x-5x (based on load)')
-print(f'✅ [Fix] Request ID conflict fixed (Atomic Counter)')
+print('='*80)
+print(f'🚀 [Server] Starting Search Service')
+print('='*80)
+print(f'📍 Address: {SERVER_HOST}:{SERVER_PORT}')
+print(f'📦 Version: {VERSION}')
+print(f'🔧 Config:')
+print(f'   - Workers: {WORKER_COUNT}')
+print(f'   - Batch Size: {MONGO_BATCH_SIZE}')
+print(f'   - Model: {MODEL_NAME.split("/")[-1]}')
+print(f'   - Debug Mode: {DEBUG_MODE}')
+print(f'⏱️  Timeout Strategy:')
+print(f'   - Strategy: Adaptive (1.5x-5x based on load)')
+print(f'   - Base Timeout: 60s')
+print(f'   - Max Request Timeout: {MAX_REQUEST_TIMEOUT}s (forced)')
+print(f'✅ Fixes Applied:')
+print(f'   - Request ID conflict fixed (Atomic Counter)')
+print(f'   - Error logging enhanced (forced output)')
+print(f'   - Encoding result validation (strict)')
+print(f'   - Request overload protection (max 50)')
+print('='*80)
 
 config = configparser.ConfigParser()
 try:
@@ -1756,13 +1836,23 @@ def cleanup():
 atexit.register(cleanup)
 
 if __name__ == '__main__':
-    print(f'✅ [Server] Ready on http://{SERVER_HOST}:{SERVER_PORT}')
-    print(f'[Server] Thread-safe parallel processing enabled')
-    print(f'[Server] Adaptive timeout strategy with forced timeout protection')
-    print(f'[Server] Maximum request duration: {MAX_REQUEST_TIMEOUT}s')
-    print(f'[Server] Stuck request detection enabled')
-    print(f'[Server] Request ID conflict FIXED (Atomic Counter)')
-    print(f'[Server] Press Ctrl+C to stop')
+    print('='*80)
+    print(f'✅ [Server] Ready!')
+    print('='*80)
+    print(f'🌐 Endpoint: http://{SERVER_HOST}:{SERVER_PORT}')
+    print(f'📊 Features:')
+    print(f'   ✓ Thread-safe parallel processing')
+    print(f'   ✓ Adaptive timeout strategy')
+    print(f'   ✓ Request ID conflict prevention')
+    print(f'   ✓ Stuck request detection')
+    print(f'   ✓ Enhanced error logging')
+    print(f'   ✓ Strict data validation')
+    print(f'🔒 Limits:')
+    print(f'   - Max concurrent requests: 50')
+    print(f'   - Max request duration: {MAX_REQUEST_TIMEOUT}s')
+    print(f'💡 Tip: Check /api-rqa-search/stats for monitoring')
+    print('='*80)
+    print(f'Press Ctrl+C to stop...\n')
     
     try:
         app.run(
@@ -1773,8 +1863,12 @@ if __name__ == '__main__':
             debug=False
         )
     except KeyboardInterrupt:
-        print('\n🛑 Server stopped by user')
+        print('\n' + '='*80)
+        print('🛑 Server stopped by user')
+        print('='*80)
     except Exception as e:
+        print('\n' + '='*80)
         print(f'❌ Server error: {e}')
+        print('='*80)
     finally:
         cleanup()
