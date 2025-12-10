@@ -10,8 +10,9 @@
 - v2.2 (2025-12-10 16:00) 增强错误处理，强制打印异常信息
 - v2.3 (2025-12-10 17:00) 严格验证编码结果，优化并发控制
 - v2.4 (2025-12-10 18:00) 完善请求完成日志，优化阶段统计
+- v2.5 (2025-12-10 19:00) 串行化重排阶段（彻底解决44秒超时问题）
 
-当前版本：v2.4
+当前版本：v2.5 - 重排串行化
 
 优化内容：
 1. ✅ 自适应超时策略（高并发场景下缩短超时）
@@ -25,7 +26,7 @@
 9. ✅ 添加请求过载保护（限流）
 10. ✅ 详细的阶段日志（便于诊断瓶颈）
 
-最后修改时间：2025-12-10 18:00
+最后修改时间：2025-12-10 19:00
 """
 
 import configparser
@@ -119,6 +120,9 @@ class AtomicRequestIDGenerator:
 
 # 全局请求ID生成器
 REQUEST_ID_GENERATOR = AtomicRequestIDGenerator()
+
+# v2.5: 重排服务串行锁（避免并发过载导致44秒超时）
+RERANK_LOCK = threading.Lock()
 
 # ==================== 自适应超时管理器 ====================
 class AdaptiveTimeoutManager:
@@ -633,7 +637,7 @@ PROFESSIONAL_DICT = set()
 
 MONGO_URL = 'mongodb://root:example@10.70.223.31:27017'
 MONGO_DB = 'rqa'
-VERSION = 'v2.4_20251210_1800'  # v2.4 - 2025-12-10 18:00 - 完善日志和统计
+VERSION = 'v2.5_20251210_1900'  # v2.5 - 2025-12-10 19:00 - 串行化重排
 
 MONGO_PIPELINE = None
 MONGO_PIPELINE_RANK = None
@@ -1625,12 +1629,14 @@ def get_data():
                 rerank_start = time.time()
                 print(f'[Request {req_id}] Stage 4: Reranking started')
                 
-                rerank_result = safe_execute(
-                    lambda: rerank_pipeline(**params),
-                    timeout=TIMEOUT_MANAGER.get_timeout('rerank_total'),
-                    default=None,
-                    operation_name="Reranking"
-                )
+                # v2.5: 串行化重排（避免并发过载）
+                with RERANK_LOCK:
+                    rerank_result = safe_execute(
+                        lambda: rerank_pipeline(**params),
+                        timeout=TIMEOUT_MANAGER.get_timeout('rerank_total'),
+                        default=None,
+                        operation_name="Reranking"
+                    )
                 
                 if rerank_result is None:
                     print(f'[Request {req_id}] ⚠️  Reranking failed after {time.time()-rerank_start:.1f}s, using previous results')
