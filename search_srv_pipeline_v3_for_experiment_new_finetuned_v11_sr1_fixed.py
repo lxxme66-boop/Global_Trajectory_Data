@@ -19,7 +19,9 @@ import numpy as np
 import pandas as pd
 
 from apscheduler.schedulers.background import BackgroundScheduler
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from elasticsearch import Elasticsearch
+from functools import wraps
 from nltk.stem.porter import PorterStemmer
 from sentence_transformers import util
 from zhkeybert import KeyBERT, extract_kws_zh
@@ -27,6 +29,76 @@ from retriever.retriever_memory_keywords import read_keywords_with_score_from_me
 from keybert import KeyBERT as KBERT
 from torch import nn
 from transformers import BertTokenizer, BertModel
+
+# ==================== 并发控制与连接池管理 ====================
+# ⭐ 关键优化：限制总并发数，避免连接池耗尽
+MAX_CONCURRENT_REQUESTS = 50  # 最大并发请求数（32并发测试 + 余量）
+REQUEST_SEMAPHORE = threading.Semaphore(MAX_CONCURRENT_REQUESTS)
+
+# MongoDB 连接池统一配置
+MONGO_POOL_CONFIG = {
+    'maxPoolSize': 300,  # 增大连接池：50并发 × 2并行 × 3倍余量
+    'minPoolSize': 80,   # 预热80个连接
+    'maxIdleTimeMS': 15000,  # ⭐ 15秒空闲超时（远小于服务器超时）
+    'connectTimeoutMS': 10000,
+    'socketTimeoutMS': 60000,  # ⭐ 60秒socket超时
+    'serverSelectionTimeoutMS': 10000,
+    'waitQueueTimeoutMS': 20000,  # ⭐ 20秒等待超时（快速失败）
+    'retryReads': True,
+    'retryWrites': True,
+    'connect': True,
+    'heartbeatFrequencyMS': 3000,  # ⭐ 3秒心跳
+}
+
+# 连接池监控
+POOL_STATS = {
+    'total_requests': 0,
+    'active_requests': 0,
+    'failed_requests': 0,
+    'connection_errors': 0,
+    'last_reset_time': time.time()
+}
+POOL_STATS_LOCK = threading.Lock()
+
+def update_pool_stats(key, delta=1):
+    """更新连接池统计"""
+    with POOL_STATS_LOCK:
+        POOL_STATS[key] += delta
+
+def get_pool_stats():
+    """获取连接池统计"""
+    with POOL_STATS_LOCK:
+        stats = POOL_STATS.copy()
+        uptime = time.time() - stats['last_reset_time']
+        stats['uptime_seconds'] = int(uptime)
+        stats['requests_per_second'] = stats['total_requests'] / uptime if uptime > 0 else 0
+        return stats
+
+# 重试装饰器优化
+def mongodb_retry(max_retries=2, initial_delay=0.5):
+    """MongoDB 查询重试装饰器 - 快速重试"""
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            for attempt in range(max_retries):
+                try:
+                    return func(*args, **kwargs)
+                except (pymongo.errors.AutoReconnect, 
+                        pymongo.errors.NetworkTimeout,
+                        pymongo.errors.ServerSelectionTimeoutError,
+                        ConnectionResetError,
+                        OSError) as e:
+                    update_pool_stats('connection_errors')
+                    if attempt == max_retries - 1:
+                        print(f'[MongoDB Retry] ❌ All {max_retries} attempts failed: {e}')
+                        raise
+                    # 快速重试：0.5s, 1s
+                    delay = initial_delay * (2 ** attempt)
+                    print(f'[MongoDB Retry] ⚠️  Attempt {attempt + 1}/{max_retries} failed, retry in {delay}s')
+                    time.sleep(delay)
+            return None
+        return wrapper
+    return decorator
 
 def zhipu_translate(id: int, text: str, from_lang: str, to_lang: str):
     """
@@ -79,54 +151,76 @@ class mongodb:
         self.collection = None
         self.last_ping_time = 0
         self.ping_lock = threading.Lock()
+        self.query_count = 0
 
     def connect(self):
-        """连接 MongoDB - 高并发优化配置"""
-        # ⭐ 关键优化：大幅增加连接池，缩短空闲超时，启用重试
-        self.client = pymongo.MongoClient(
-            self.url, 
-            maxPoolSize=200,  # 32并发 × 2并行 × 3倍余量 = 192
-            minPoolSize=50,   # 预热50个连接，减少动态创建
-            maxIdleTimeMS=20000,  # 20秒：远小于MongoDB服务器默认超时
-            connectTimeoutMS=10000,
-            socketTimeoutMS=60000,  # ⭐ 关键：60秒socket超时，避免长时间挂起
-            serverSelectionTimeoutMS=10000,
-            waitQueueTimeoutMS=30000,  # ⭐ 队列等待超时
-            retryReads=True,  # ⭐ 启用自动重试
-            retryWrites=True,
-            connect=True,  # 立即连接
-            heartbeatFrequencyMS=3000,  # ⭐ 3秒心跳，快速检测死连接
-        )
+        """连接 MongoDB - 统一配置，高并发优化"""
+        print(f'[MongoDB] Connecting to {self.db_name}...')
+        
+        # ⭐ 使用统一的连接池配置
+        self.client = pymongo.MongoClient(self.url, **MONGO_POOL_CONFIG)
+        
         self.db = self.client[self.db_name]
-        print(f'[MongoDB] Connected: {self.db_name}, pool_size={self.client.max_pool_size}')
-        print(f'[MongoDB] Collections: {self.db.list_collection_names()[:5]}...')
         self.collection = self.db[self.table_name]
-        # 预热连接池
-        self.ping()
+        
+        # 预热连接池：发起一次查询
+        try:
+            self.client.admin.command('ping')
+            self.last_ping_time = time.time()
+            print(f'[MongoDB] ✅ Connected: {self.db_name}')
+            print(f'[MongoDB] Pool: max={self.client.max_pool_size}, min={self.client.min_pool_size}')
+            print(f'[MongoDB] Collections: {self.db.list_collection_names()[:3]}...')
+        except Exception as e:
+            print(f'[MongoDB] ❌ Connection failed: {e}')
+            raise
     
     def ping(self):
-        """定期心跳检查，验证连接存活"""
-        with self.ping_lock:
-            current_time = time.time()
-            # 每10秒ping一次
-            if current_time - self.last_ping_time > 10:
-                try:
-                    self.client.admin.command('ping')
-                    self.last_ping_time = current_time
-                    return True
-                except Exception as e:
-                    print(f'[MongoDB Ping] FAILED: {e}')
-                    return False
+        """轻量级心跳检查"""
+        current_time = time.time()
+        # 每10秒检查一次
+        if current_time - self.last_ping_time < 10:
             return True
+        
+        with self.ping_lock:
+            # 双重检查
+            if current_time - self.last_ping_time < 10:
+                return True
+            
+            try:
+                self.client.admin.command('ping')
+                self.last_ping_time = current_time
+                return True
+            except Exception as e:
+                print(f'[MongoDB Ping] ⚠️  Failed: {e}')
+                update_pool_stats('connection_errors')
+                return False
+    
+    def get_pool_info(self):
+        """获取连接池信息（PyMongo 4.x）"""
+        try:
+            # PyMongo 没有直接暴露连接池状态API，这里返回配置信息
+            return {
+                'max_pool_size': self.client.max_pool_size,
+                'min_pool_size': self.client.min_pool_size,
+                'query_count': self.query_count
+            }
+        except:
+            return {}
     
     def insert_one(self, data):
         result = self.collection.insert_one(data)
         return
 
-    def find_data(self, conditions):
-        # 查询前ping检查
+    @mongodb_retry(max_retries=2, initial_delay=0.5)
+    def find_data(self, conditions, **kwargs):
+        """查询数据 - 带重试和健康检查"""
+        # 轻量级健康检查（每10秒一次）
         self.ping()
-        return self.collection.find(conditions)
+        
+        self.query_count += 1
+        
+        # 执行查询
+        return self.collection.find(conditions, **kwargs)
 
 sys.path.append("..")
 
@@ -303,22 +397,24 @@ def load_data(table: str, model_name: str):
     global QUERY_CLASS_TOKENIZER
     global PROFESSIONAL_DICT
 
-    # ✅ 修改3: 加载MongoDB连接相关组件 - 添加连接池支持并发
+    # ⭐ 统一配置：两个MongoDB客户端使用相同配置
+    print('[MongoDB] Initializing MONGO_PIPELINE...')
     MONGO_PIPELINE = mongodb(MONGO_URL, MONGO_DB, table)
     MONGO_PIPELINE.connect()
     
-    # ✅ 修改4: 创建 MONGO_PIPELINE_RANK 时也添加连接池参数
-    client = pymongo.MongoClient(
-        "mongodb://root:example@10.70.223.31:27017", 
-        maxPoolSize=50, 
-        minPoolSize=10,
-        maxIdleTimeMS=30000,  # 连接最大空闲时间30秒
-        connectTimeoutMS=10000,  # 连接超时10秒
-        serverSelectionTimeoutMS=10000  # 服务器选择超时10秒
-    )
-    # db = client['scrapy']
+    # ⭐ 统一配置：MONGO_PIPELINE_RANK 使用相同的连接池配置
+    print('[MongoDB] Initializing MONGO_PIPELINE_RANK...')
+    client = pymongo.MongoClient(MONGO_URL, **MONGO_POOL_CONFIG)
+    
     db = client[MONGO_DB]
     MONGO_PIPELINE_RANK = db[MONGODB_C_NAME]
+    
+    # 预热连接
+    try:
+        client.admin.command('ping')
+        print(f'[MongoDB] ✅ MONGO_PIPELINE_RANK connected')
+    except Exception as e:
+        print(f'[MongoDB] ❌ MONGO_PIPELINE_RANK connection failed: {e}')
     
     # client = pymongo.MongoClient("mongodb://rqa:intermilano@10.70.223.31:27017")
     # db = client['rqa']
@@ -428,6 +524,37 @@ def crontab_update_config():
     print(
         f'[update config] 执行定时任务(minute=*/3)@{datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")}：{__name__}; Reading TOKEN_LIMIT={TOKEN_LIMIT}, SCORE_THREHOLD={SCORE_THREHOLD}, RETRIEVE_CHUNK_NUM={RETRIEVE_CHUNK_NUM}')
     return
+
+
+def crontab_connection_health_check():
+    """
+    定期连接池健康检查和统计
+    - 检查 MongoDB 连接是否存活
+    - 打印连接池统计信息
+    - 释放无用连接（通过 ping 触发）
+    """
+    try:
+        # 健康检查
+        if MONGO_PIPELINE and MONGO_PIPELINE.client:
+            MONGO_PIPELINE.ping()
+        
+        # 打印统计
+        stats = get_pool_stats()
+        print(f'[Pool Health] Active: {stats["active_requests"]}, '
+              f'Total: {stats["total_requests"]}, '
+              f'Failed: {stats["failed_requests"]}, '
+              f'Errors: {stats["connection_errors"]}, '
+              f'RPS: {stats["requests_per_second"]:.2f}')
+        
+        # 如果错误率高，打印警告
+        if stats['total_requests'] > 100:
+            error_rate = stats['connection_errors'] / stats['total_requests']
+            if error_rate > 0.05:  # 5% 错误率
+                print(f'[Pool Health] ⚠️  High error rate: {error_rate*100:.1f}%')
+        
+    except Exception as e:
+        print(f'[Pool Health] ❌ Check failed: {e}')
+
 
 def check_query_relevance(query: str) -> bool:
     """
@@ -698,22 +825,30 @@ def rank_pipeline(**kwargs):
     
     search_start_time = time.time()
     
-    # search 请求用于m3e精排的数据：m3e embed
+    # ⭐ 优化：添加查询超时控制（60秒）
     embed_info = {}
-    score_iter = MONGO_PIPELINE_RANK.find(find_condition,
-                                         {'_id':0, 'index':1, 'doc_id':1, 'embedding':1})
-    
-    # ✅ 修改2: 将游标转换为列表，避免游标超时导致连接关闭
-    # **修改：构建 embed_info，使用联合主键**
-    for record in list(score_iter):  # ← 核心修改：list() 立即执行查询，避免游标超时
-        index = record.get('index')
-        doc_id = record.get('doc_id')
-        embedding = record.get('embedding')
-        if index is not None and doc_id is not None:
-            combined_key = f"{index}_{doc_id}"
-            embed_info[combined_key] = embedding
-    
-    print(f'[rank_pipeline] embed_info cnt={len(embed_info)}, mongo search time = {time.time() - search_start_time}')
+    try:
+        score_iter = MONGO_PIPELINE_RANK.find(
+            find_condition,
+            {'_id': 0, 'index': 1, 'doc_id': 1, 'embedding': 1}
+        ).max_time_ms(60000)  # ⭐ 60秒超时
+        
+        # 立即执行查询，避免游标超时
+        for record in list(score_iter):
+            index = record.get('index')
+            doc_id = record.get('doc_id')
+            embedding = record.get('embedding')
+            if index is not None and doc_id is not None:
+                combined_key = f"{index}_{doc_id}"
+                embed_info[combined_key] = embedding
+        
+        print(f'[rank_pipeline] ✅ embed_info={len(embed_info)}, time={time.time() - search_start_time:.2f}s')
+    except pymongo.errors.ExecutionTimeout:
+        print(f'[rank_pipeline] ⏰ MongoDB query TIMEOUT after 60s')
+        # 超时后继续处理，使用已有数据
+    except Exception as e:
+        print(f'[rank_pipeline] ❌ Query failed: {e}')
+        update_pool_stats('connection_errors')
     
     # search 请求切片、doc_name数据
     data_iter = list(MONGO_PIPELINE.find_data(find_condition))
@@ -791,13 +926,20 @@ def rank_pipeline(**kwargs):
         data_iter2 = list(MONGO_PIPELINE.find_data(find_condition2))
         cnt2, cnt_final = 0, 0
 
-        # 同时补充score的m3e embed
-        score_iter2 = MONGO_PIPELINE_RANK.find(find_condition2,
-                                                 {'_id':0, 'index':1, 'embedding':1})
-        # ✅ 修改2.5: 将游标转换为列表，避免游标超时
-        for r in list(score_iter2):  # ← 核心修改：list() 立即执行查询
-            embed_info[int(r['index'])] = r['embedding']
-        print(f'after boosting by kw embed_info cnt={len(embed_info)}')
+        # ⭐ 优化：添加查询超时控制
+        try:
+            score_iter2 = MONGO_PIPELINE_RANK.find(
+                find_condition2,
+                {'_id': 0, 'index': 1, 'embedding': 1}
+            ).max_time_ms(60000)  # ⭐ 60秒超时
+            
+            for r in list(score_iter2):
+                embed_info[int(r['index'])] = r['embedding']
+            print(f'[rank_pipeline] ✅ Keyword boost: embed_info={len(embed_info)}')
+        except pymongo.errors.ExecutionTimeout:
+            print(f'[rank_pipeline] ⏰ Keyword boost query TIMEOUT')
+        except Exception as e:
+            print(f'[rank_pipeline] ❌ Keyword boost failed: {e}')
 
         # 每个doc_id取top-5
         docid_index_dict = {}
@@ -1208,129 +1350,178 @@ def query_expand_srv(query: str, query_expand: list):
 def hello_world():
     return json_result(0, '', 'Service available')
 
+@app.route('/api-rqa-search/stats', methods=['GET'])
+def get_stats():
+    """获取服务统计信息"""
+    stats = {
+        'pool_stats': get_pool_stats(),
+        'mongo_pool_config': {
+            'maxPoolSize': MONGO_POOL_CONFIG['maxPoolSize'],
+            'minPoolSize': MONGO_POOL_CONFIG['minPoolSize'],
+            'maxIdleTimeMS': MONGO_POOL_CONFIG['maxIdleTimeMS'],
+        },
+        'max_concurrent_requests': MAX_CONCURRENT_REQUESTS,
+        'version': VERSION,
+        'model': MODEL_NAME
+    }
+    try:
+        if MONGO_PIPELINE and MONGO_PIPELINE.client:
+            stats['mongo_pipeline_info'] = MONGO_PIPELINE.get_pool_info()
+    except:
+        pass
+    return json_result(0, '', stats)
+
+
 @app.route('/api-rqa-search/search', methods=['POST'])
 def get_data():
     """
-    搜索服务主函数
+    搜索服务主函数 - 带并发控制
     """
-    form = request.form
-    query = form.get('query', '', str)
-    query_en = form.get('query_dst', '', str)
-    id = form.get('id', 0, int)
-    is_debug = form.get('debug', 0, int) == 1
-    top_doc_num = form.get('top_doc_num', 0, int)
-    target_doc_name = form.get('target_doc_name', '', str)
-    # add delete doc_id serve
-    is_delete = form.get('is_delete', 0, int)
-    delete_doc_id = form.get('delete_doc_id', '', str)
-    if query == '':
-        return json_result(-1, 'query must not be null.', None)
-    if id == 0:
-        return json_result(-1, 'id must not be null.', None)
-    if top_doc_num == 0:
-        return json_result(-1, 'top_doc_num must not be null.', None)
-    if is_delete == 1 and delete_doc_id:
-        delete_doc_id_list = [int(t) for t in delete_doc_id.split(',')]
-        res = MONGO_PIPELINE.collection.delete_many({
-            'doc_id': {'$in': delete_doc_id_list}
-        })
-        return json_result(0, f'delete {delete_doc_id_list} successfully', None)
-
-    start_time = time.time()
-    code = 0
-    msg = ''
-    data = {}
-    data['model'] = MODEL_NAME
-    data['version'] = VERSION
-
-    if 1:
-        # return JsonLst
-        json_arr = []
-        # 步骤2: 查询预处理: 中英文翻译, 生成查询向量
-        # 生成查询向量
-        query_embed = encode_from_net(query)
-        query_rank_embed = encode_from_net(query)
-
-        result_dict = {}
-        start_time = time.time()
-        params = {}
-        params['id'] = id
-        params['query'] = query
-        # zhipu_translate 功能已关闭
-        if has_chinese(query):
-            params['query_zh'] = query
-            params['query_en'] = query_en if query_en else query  # 直接使用传入的 query_en
-        else:
-            params['query_en'] = query
-            params['query_zh'] = query  # 不进行翻译，直接使用原query
-        # print(f'[get_data] zhipu translate using {time.time()-start_time} seconds')
-        # query_expand 功能已关闭，只使用原始query
-        query_expand = [query]
-        # print(f'query expand spent time = {time.time() - start_time}')
-        params['query_expand'] = query_expand
-        query_embed = encode_from_net(query)
-        query_embed_expand = encode_from_net(query_expand)
-        query_rank_embed_expand = encode_from_net(query_expand)
-        print(f'[get_data] expand queries = {query_expand}, emb_len={len(query_embed_expand)}')
-
-        params['query_embed'] = query_embed
-        params['query_embed_expand'] = query_embed_expand
-        params['query_rank_embed'] = query_rank_embed
-        params['query_rank_embed_expand'] = query_rank_embed_expand
-        params['target_doc_name'] = target_doc_name
-        params['flag_query_rel'] = True
+    # ⭐ 并发控制：限制同时处理的请求数
+    acquired = REQUEST_SEMAPHORE.acquire(blocking=False)
+    if not acquired:
+        # 连接池已满，快速返回503
+        update_pool_stats('failed_requests')
+        return json_result(-1, 'Service busy, please retry later', {
+            'error': 'Too many concurrent requests',
+            'max_concurrent': MAX_CONCURRENT_REQUESTS
+        }), 503
+    
+    try:
+        update_pool_stats('total_requests')
+        update_pool_stats('active_requests')
         
-        if len(query_en.strip()) > 0:
-            params['query_en'] = query_en
-        params['result_dict'] = result_dict
-        # 步骤3: 多路召回
-        params = recall_pipeline(**params)
-        print(f'recall spent time = {time.time() - start_time}')
-        if not params['flag_query_rel']:
-            code = 1
-            data['msg'] = 'query must be relevant'
+        form = request.form
+        query = form.get('query', '', str)
+        query_en = form.get('query_dst', '', str)
+        id = form.get('id', 0, int)
+        is_debug = form.get('debug', 0, int) == 1
+        top_doc_num = form.get('top_doc_num', 0, int)
+        target_doc_name = form.get('target_doc_name', '', str)
+        is_delete = form.get('is_delete', 0, int)
+        delete_doc_id = form.get('delete_doc_id', '', str)
+        
+        # 参数校验
+        if query == '':
+            return json_result(-1, 'query must not be null.', None)
+        if id == 0:
+            return json_result(-1, 'id must not be null.', None)
+        if top_doc_num == 0:
+            return json_result(-1, 'top_doc_num must not be null.', None)
+        
+        # 删除操作
+        if is_delete == 1 and delete_doc_id:
+            delete_doc_id_list = [int(t) for t in delete_doc_id.split(',')]
+            res = MONGO_PIPELINE.collection.delete_many({
+                'doc_id': {'$in': delete_doc_id_list}
+            })
+            return json_result(0, f'delete {delete_doc_id_list} successfully', None)
+
+        start_time = time.time()
+        code = 0
+        msg = ''
+        data = {}
+        data['model'] = MODEL_NAME
+        data['version'] = VERSION
+
+        try:
+            json_arr = []
+            
+            # ⭐ 优化：只调用一次编码服务
+            encode_start = time.time()
+            query_embed = encode_from_net(query)
+            print(f'[Encode] {time.time() - encode_start:.2f}s')
+            
+            # ⭐ 复用编码结果，避免重复调用
+            query_rank_embed = query_embed
+            query_expand = [query]
+            query_embed_expand = [query_embed]
+            query_rank_embed_expand = [query_embed]
+
+            result_dict = {}
+            params = {}
+            params['id'] = id
+            params['query'] = query
+            
+            if has_chinese(query):
+                params['query_zh'] = query
+                params['query_en'] = query_en if query_en else query
+            else:
+                params['query_en'] = query
+                params['query_zh'] = query
+            
+            params['query_expand'] = query_expand
+            params['query_embed'] = query_embed
+            params['query_embed_expand'] = query_embed_expand
+            params['query_rank_embed'] = query_rank_embed
+            params['query_rank_embed_expand'] = query_rank_embed_expand
+            params['target_doc_name'] = target_doc_name
+            params['flag_query_rel'] = True
+            
+            if len(query_en.strip()) > 0:
+                params['query_en'] = query_en
+            params['result_dict'] = result_dict
+            
+            # 步骤3: 多路召回
+            recall_start = time.time()
+            params = recall_pipeline(**params)
+            print(f'[Recall] {time.time() - recall_start:.2f}s')
+            
+            if not params['flag_query_rel']:
+                code = 1
+                data['msg'] = 'query must be relevant'
+                data['doc_num'] = 0
+                data['arr'] = []
+                return json_result(code, msg, data)
+
+            # 步骤4: 排序与重排
+            rank_start = time.time()
+            params = rank_pipeline(**params)
+            print(f'[Rank] {time.time() - rank_start:.2f}s')
+            
+            rerank_start = time.time()
+            params = rerank_pipeline(**params)
+            print(f'[Rerank] {time.time() - rerank_start:.2f}s')
+            
+            params['top_doc_num'] = top_doc_num
+            params['concat_num'] = CONCAT_CHUNK_NUM
+            params['is_debug'] = is_debug
+
+            # 步骤5: 结果拼接与返回
+            concat_start = time.time()
+            similar_shards = concat_shards_by_rank(**params)
+            print(f'[Concat] {time.time() - concat_start:.2f}s')
+            
+            for dict in similar_shards:
+                score = dict['score']
+                if score < SCORE_THREHOLD:
+                    break
+                json_arr.append(dict)
+
+            data['arr'] = json_arr
+            data['doc_num'] = len(json_arr)
+
+        except Exception as e:
+            code = -1
+            msg = str(e)
+            error_trace = traceback.format_exc()
+            print(f'[Error] {error_trace}')
+            data['msg'] = msg
             data['doc_num'] = 0
             data['arr'] = []
-            return json_result(code, msg, data)
-        # 调用前
+            update_pool_stats('failed_requests')
 
-        # 步骤4: 排序与重排
-        params = rank_pipeline(**params)
-        print(f'rank spent time = {time.time() - start_time}')
-        params = rerank_pipeline(**params)
-        print(f'rerank spent time = {time.time() - start_time}')
-        print(f'In request: query={query}, top_doc_num={top_doc_num}')
-        params['top_doc_num'] = top_doc_num
-        params['concat_num'] = CONCAT_CHUNK_NUM
-        params['is_debug'] = is_debug
-
-        # 步骤5: 结果拼接与返回
-        similar_shards = concat_shards_by_rank(**params)
-        high_scores = []  # 用于保存高于阈值的得分
-        for dict in similar_shards:
-            score = dict['score']
-            print(score)
-            if score < SCORE_THREHOLD:
-                break
-            high_scores.append(score)
-            json_arr.append(dict)
+        now = datetime.datetime.now()
+        data['ts'] = int(datetime.datetime.timestamp(now) * 1000)
+        total_time = time.time() - start_time
+        print(f'[Request] ✅ Total: {total_time:.2f}s, results: {len(json_arr) if "json_arr" in locals() else 0}')
         
-
-        # 构造response
-        data['arr'] = json_arr
-        data['doc_num'] = len(json_arr)
-
-    else:
-        code = -1
-        msg = traceback.format_exc()
-        data['msg'] = msg
-        data['doc_num'] = 0
-        data['arr'] = []
-
-    now = datetime.datetime.now()
-    data['ts'] = int(datetime.datetime.timestamp(now) * 1000)
-    print(f'total spent time = {time.time() - start_time}')
-    return json_result(code, msg, data)
+        return json_result(code, msg, data)
+        
+    finally:
+        # ⭐ 释放信号量，确保并发控制正常
+        REQUEST_SEMAPHORE.release()
+        update_pool_stats('active_requests', -1)
 
 
 @app.route('/api-rqa-search/download', methods=['GET'])
@@ -1386,10 +1577,40 @@ print(f'load mongo tbl={TABLE_NAME} , {type(TABLE_NAME)}, version={VERSION}')
 
 scheduler = BackgroundScheduler()
 scheduler.add_job(crontab_update_config, 'interval', seconds=180, coalesce=True, replace_existing=True)
+# ⭐ 添加连接池健康检查任务（每30秒）
+scheduler.add_job(crontab_connection_health_check, 'interval', seconds=30, coalesce=True, replace_existing=True)
 scheduler.start()
+print('[Scheduler] ✅ Background tasks started: config_update(180s), health_check(30s)')
+
+print('\n' + '='*80)
+print('🚀 Starting RQA Search Service')
+print('='*80)
 
 load_data(TABLE_NAME, MODEL_NAME)
 
+print('\n' + '='*80)
+print('📊 Service Configuration:')
+print(f'  Model: {MODEL_NAME}')
+print(f'  Version: {VERSION}')
+print(f'  MongoDB Pool:')
+print(f'    - maxPoolSize: {MONGO_POOL_CONFIG["maxPoolSize"]}')
+print(f'    - minPoolSize: {MONGO_POOL_CONFIG["minPoolSize"]}')
+print(f'    - maxIdleTimeMS: {MONGO_POOL_CONFIG["maxIdleTimeMS"]}ms')
+print(f'    - socketTimeoutMS: {MONGO_POOL_CONFIG["socketTimeoutMS"]}ms')
+print(f'  Concurrency:')
+print(f'    - Max concurrent requests: {MAX_CONCURRENT_REQUESTS}')
+print(f'    - Flask threaded: True')
+print(f'  Timeouts:')
+print(f'    - MongoDB query: 60s')
+print(f'    - Socket: 60s')
+print('='*80 + '\n')
+
 if __name__ == '__main__':
+    print(f'✅ Service ready at http://10.70.223.31:9510')
+    print(f'   - Health check: GET  /api-rqa-search/test')
+    print(f'   - Statistics:   GET  /api-rqa-search/stats')
+    print(f'   - Search:       POST /api-rqa-search/search')
+    print('='*80 + '\n')
+    
     # 启用多线程支持并发请求处理
     app.run('10.70.223.31', port=9510, threaded=True, processes=1)
