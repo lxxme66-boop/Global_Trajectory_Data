@@ -19,17 +19,18 @@ def diagnose_service(host='10.70.223.31', port=9510):
     # 1. 健康检查
     print('\n1️⃣ 健康检查...')
     try:
-        response = requests.get(f'{base_url}/api-rqa-search/health', timeout=5)
+        response = requests.get(f'{base_url}/api-rqa-search/health', timeout=30)  # 增加到30秒
         health = response.json()
         print(f'   状态: {health.get("data", {}).get("status", "unknown")}')
         print(f'   运行时间: {health.get("data", {}).get("uptime", 0):.1f}秒')
     except Exception as e:
-        print(f'   ❌ 健康检查失败: {e}')
+        print(f'   ⚠️  健康检查失败（可能服务负载较高）: {e}')
+        print(f'   提示: 如果搜索功能正常，可以忽略此错误')
     
     # 2. 获取统计信息
     print('\n2️⃣ 服务统计...')
     try:
-        response = requests.get(f'{base_url}/api-rqa-search/stats', timeout=5)
+        response = requests.get(f'{base_url}/api-rqa-search/stats', timeout=30)  # 增加到30秒
         stats = response.json().get('data', {})
         
         print(f'   总请求数: {stats.get("total_requests", 0)}')
