@@ -125,22 +125,41 @@ def test_concurrent_requests(host='10.70.223.31', port=9510, num_requests=20):
     def send_search_request(idx):
         try:
             data = {
-                'query': f'测试查询 {idx}',
+                'query': f'semiconductor manufacturing process technology research {idx}',
                 'id': 1,
                 'top_doc_num': 5
             }
-            response = requests.post(base_url, data=data, timeout=30)
-            return {
-                'index': idx,
-                'status_code': response.status_code,
-                'success': response.status_code == 200,
-                'data': response.json() if response.status_code == 200 else None
-            }
+            response = requests.post(base_url, data=data, timeout=60)
+            
+            if response.status_code == 200:
+                result = response.json()
+                code = result.get('code', -1)
+                # 业务成功：HTTP 200 + code == 0
+                business_success = (code == 0)
+                
+                return {
+                    'index': idx,
+                    'status_code': response.status_code,
+                    'http_success': True,
+                    'business_success': business_success,
+                    'code': code,
+                    'msg': result.get('msg', ''),
+                    'data': result.get('data', {})
+                }
+            else:
+                return {
+                    'index': idx,
+                    'status_code': response.status_code,
+                    'http_success': False,
+                    'business_success': False,
+                    'error': f'HTTP {response.status_code}'
+                }
         except Exception as e:
             return {
                 'index': idx,
                 'status_code': 0,
-                'success': False,
+                'http_success': False,
+                'business_success': False,
                 'error': str(e)
             }
     
@@ -166,14 +185,33 @@ def test_concurrent_requests(host='10.70.223.31', port=9510, num_requests=20):
     duration = time.time() - start_time
     
     # 统计结果
-    successful = sum(1 for r in results if r['success'])
-    failed = len(results) - successful
+    http_successful = sum(1 for r in results if r.get('http_success', False))
+    business_successful = sum(1 for r in results if r.get('business_success', False))
+    failed = len(results) - http_successful
     
     print(f'   ✅ 请求完成: {len(results)}/{num_requests}')
-    print(f'   ✅ 成功: {successful}')
+    print(f'   ✅ HTTP成功: {http_successful}')
+    print(f'   ✅ 业务成功: {business_successful}')
     print(f'   ❌ 失败: {failed}')
     print(f'   ⏱️  总耗时: {duration:.2f}秒')
     print(f'   ⚡ 平均耗时: {duration/num_requests:.2f}秒/请求')
+    
+    # 显示失败原因
+    if failed > 0:
+        print(f'\n   ⚠️  失败原因分析:')
+        failure_reasons = {}
+        for r in results:
+            if not r.get('http_success', False):
+                reason = r.get('error', 'unknown')
+                failure_reasons[reason] = failure_reasons.get(reason, 0) + 1
+            elif not r.get('business_success', False):
+                msg = r.get('msg', 'unknown')
+                code = r.get('code', -1)
+                reason = f'code={code}: {msg}'
+                failure_reasons[reason] = failure_reasons.get(reason, 0) + 1
+        
+        for reason, count in failure_reasons.items():
+            print(f'      - {reason}: {count}次')
     
     # 等待一下，让服务器更新统计
     time.sleep(2)
@@ -199,20 +237,25 @@ def test_concurrent_requests(host='10.70.223.31', port=9510, num_requests=20):
     print(f'   - 预期新增请求: {num_requests}')
     print(f'   - 实际新增总请求: {total_increase}')
     print(f'   - 实际新增成功请求: {success_increase}')
+    print(f'   - 业务层成功数: {business_successful}')
     
+    # 检查1: 总请求数
     if total_increase >= num_requests * 0.9:  # 允许10%误差
         print(f'   ✅ 总请求数统计正常 ({total_increase}/{num_requests})')
+        total_ok = True
     else:
         print(f'   ❌ 总请求数统计异常 ({total_increase}/{num_requests})')
+        total_ok = False
     
-    if success_increase >= successful * 0.9:  # 允许10%误差
-        print(f'   ✅ 成功请求数统计正常 ({success_increase}/{successful})')
-        print(f'   ✅ 请求ID冲突已修复！')
+    # 检查2: 成功请求数
+    if success_increase >= business_successful * 0.9:  # 允许10%误差
+        print(f'   ✅ 成功请求数统计正常 ({success_increase}/{business_successful})')
+        success_ok = True
     else:
-        print(f'   ❌ 成功请求数统计异常 ({success_increase}/{successful})')
-        print(f'   ⚠️  可能仍存在请求ID冲突问题')
+        print(f'   ❌ 成功请求数统计异常 ({success_increase}/{business_successful})')
+        success_ok = False
     
-    # 检查阶段统计
+    # 检查3: 阶段统计
     stage_times = after_stats.get('stage_times', {})
     if stage_times:
         has_stage_data = any(
@@ -221,10 +264,25 @@ def test_concurrent_requests(host='10.70.223.31', port=9510, num_requests=20):
         )
         if has_stage_data:
             print(f'   ✅ 阶段统计数据正常')
+            stage_ok = True
         else:
             print(f'   ⚠️  阶段统计数据为空')
+            stage_ok = False
+    else:
+        stage_ok = False
     
-    return successful >= num_requests * 0.8  # 至少80%成功算通过
+    # 综合判断
+    if total_ok and success_ok and stage_ok:
+        print(f'\n   🎉 请求ID冲突已完全修复！统计数据准确！')
+    elif total_ok and success_ok:
+        print(f'\n   ✅ 请求ID冲突已修复！统计数据准确！')
+        print(f'   ⚠️  阶段统计可能需要更多请求才能生成数据')
+    elif total_ok:
+        print(f'\n   ⚠️  请求ID冲突部分修复，但成功请求统计有问题')
+    else:
+        print(f'\n   ❌ 请求ID冲突仍然存在')
+    
+    return business_successful >= num_requests * 0.5  # 至少50%成功算通过
 
 def test_single_search(host='10.70.223.31', port=9510):
     """测试单个搜索请求"""

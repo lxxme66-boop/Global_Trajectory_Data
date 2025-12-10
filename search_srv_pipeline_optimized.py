@@ -1395,6 +1395,7 @@ def get_data():
     """搜索服务主函数（自适应超时 + 强制超时保护 + 修复请求ID冲突）"""
     # ✅ 使用线程安全的原子计数器生成唯一ID（修复冲突问题）
     req_id = REQUEST_ID_GENERATOR.generate()
+    request_started = False
     
     try:
         form = request.form
@@ -1407,15 +1408,17 @@ def get_data():
         is_delete = form.get('is_delete', 0, int)
         delete_doc_id = form.get('delete_doc_id', '', str)
         
-        MONITOR.start_request(req_id, query)
-        TIMEOUT_MANAGER.enter_request()
-        
         if not query:
             return json_result(-1, 'query must not be null.', None)
         if not id:
             return json_result(-1, 'id must not be null.', None)
         if not top_doc_num:
             return json_result(-1, 'top_doc_num must not be null.', None)
+        
+        # 标记请求开始（必须在参数验证通过后）
+        MONITOR.start_request(req_id, query)
+        TIMEOUT_MANAGER.enter_request()
+        request_started = True
         
         if is_delete == 1 and delete_doc_id:
             try:
@@ -1426,6 +1429,9 @@ def get_data():
                 return json_result(0, f'deleted {res.deleted_count} documents', None)
             except Exception as e:
                 return json_result(-1, f'delete failed: {e}', None)
+            finally:
+                MONITOR.end_request(req_id, success=True)
+                TIMEOUT_MANAGER.exit_request()
         
         start_time = time.time()
         
@@ -1556,13 +1562,6 @@ def get_data():
             msg = result['msg']
             data['arr'] = result['arr']
             data['doc_num'] = result['doc_num']
-            
-            if code == -2:
-                MONITOR.end_request(req_id, success=False, timeout=False, forced_timeout=True)
-            elif code == 0:
-                MONITOR.end_request(req_id, success=True)
-            else:
-                MONITOR.end_request(req_id, success=False)
                 
         except Exception as e:
             code = -1
@@ -1574,9 +1573,17 @@ def get_data():
                 print(f'[Request {req_id}] Error: {traceback.format_exc()[:500]}')
             else:
                 print(f'[Request {req_id}] Error: {msg}')
-            MONITOR.end_request(req_id, success=False)
         finally:
-            TIMEOUT_MANAGER.exit_request()
+            # ✅ 确保一定会调用 end_request（放在 finally 块中）
+            if request_started:
+                if code == -2:
+                    MONITOR.end_request(req_id, success=False, timeout=False, forced_timeout=True)
+                elif code == 0:
+                    MONITOR.end_request(req_id, success=True)
+                else:
+                    MONITOR.end_request(req_id, success=False)
+                
+                TIMEOUT_MANAGER.exit_request()
         
         data['ts'] = int(time.time() * 1000)
         data['process_time'] = time.time() - start_time
@@ -1588,6 +1595,9 @@ def get_data():
         
     except Exception as e:
         print(f'[Request {req_id}] Fatal error: {e}')
+        if request_started:
+            MONITOR.end_request(req_id, success=False)
+            TIMEOUT_MANAGER.exit_request()
         return json_result(-999, f'System error: {str(e)}', {'doc_num': 0, 'arr': []})
 
 @app.route('/api-rqa-search/download', methods=['GET'])
