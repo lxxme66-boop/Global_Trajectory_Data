@@ -12,8 +12,9 @@
 - v2.4 (2025-12-10 18:00) 完善请求完成日志，优化阶段统计
 - v2.5 (2025-12-10 19:00) 串行化重排阶段（彻底解决44秒超时问题）
 - v2.6 (2025-12-10 20:00) 添加防御性类型检查（修复append错误）
+- v2.7 (2025-12-10 21:00) 增强稳定性（3倍超时+减小批量+强化防御）
 
-当前版本：v2.6 - 串行化+防御性检查
+当前版本：v2.7 - 超稳定版
 
 优化内容：
 1. ✅ 自适应超时策略（高并发场景下缩短超时）
@@ -26,8 +27,10 @@
 8. ✅ 严格验证编码服务返回结果
 9. ✅ 添加请求过载保护（限流）
 10. ✅ 详细的阶段日志（便于诊断瓶颈）
+11. ✅ 串行化重排（避免44秒过载）
+12. ✅ 增强稳定性（3倍超时+减小批量+强化防御）
 
-最后修改时间：2025-12-10 20:00
+最后修改时间：2025-12-10 21:00
 """
 
 import configparser
@@ -74,13 +77,13 @@ parser.add_argument('--host', type=str, default='10.70.223.31', help='服务地�
 parser.add_argument('--workers', type=int, default=4, help='工作线程数（默认：4）')
 parser.add_argument('--batch-size', type=int, default=100, help='MongoDB批次大小（默认：100）')
 parser.add_argument('--debug', action='store_true', help='启用调试模式')
-parser.add_argument('--request-timeout', type=int, default=300, help='单个请求最大超时（秒，默认：300）')
+parser.add_argument('--request-timeout', type=int, default=600, help='单个请求最大超时（秒，默认：600）')  # v2.7: 300→600
 args = parser.parse_args()
 
 SERVER_PORT = args.port
 SERVER_HOST = args.host
 WORKER_COUNT = max(2, min(args.workers, 16))
-MONGO_BATCH_SIZE = max(50, min(args.batch_size, 500))
+MONGO_BATCH_SIZE = max(30, min(args.batch_size, 300))  # v2.7: 50→30, 500→300
 DEBUG_MODE = args.debug
 MAX_REQUEST_TIMEOUT = args.request_timeout  # 单个请求最大超时
 
@@ -127,27 +130,38 @@ RERANK_LOCK = threading.Lock()
 
 # ==================== 自适应超时管理器 ====================
 class AdaptiveTimeoutManager:
-    """自适应超时管理器"""
-    def __init__(self, base_timeout=60, max_timeout=300):
+    """自适应超时管理器（v2.7: 增加超时时长）"""
+    def __init__(self, base_timeout=90, max_timeout=600):  # v2.7: 90s → 600s
         self.base_timeout = base_timeout
         self.max_timeout = max_timeout
         self.active_requests = 0
         self.lock = threading.Lock()
     
     def get_timeout(self, stage='default'):
-        """根据当前负载获取超时时间"""
+        """根据当前负载获取超时时间（v2.7: 支持阶段特定基础值）"""
         with self.lock:
-            # 基于活跃请求数动态调整
-            if self.active_requests <= 5:
-                multiplier = 5.0  # 低负载：5倍
-            elif self.active_requests <= 10:
-                multiplier = 3.0  # 中负载：3倍
-            elif self.active_requests <= 20:
-                multiplier = 2.0  # 高负载：2倍
-            else:
-                multiplier = 1.5  # 超高负载：1.5倍
+            # v2.7: 阶段特定基础值
+            stage_base = {
+                'encode': 60,
+                'recall': 120,
+                'rank': 240,
+                'rerank': 180,
+                'rerank_total': 360,
+                'default': self.base_timeout
+            }
+            base = stage_base.get(stage, self.base_timeout)
             
-            timeout = min(self.base_timeout * multiplier, self.max_timeout)
+            # v2.7: 增加倍数，更宽容
+            if self.active_requests <= 5:
+                multiplier = 8.0  # 低负载：8倍（原5倍）
+            elif self.active_requests <= 10:
+                multiplier = 5.0  # 中负载：5倍（原3倍）
+            elif self.active_requests <= 20:
+                multiplier = 3.0  # 高负载：3倍（原2倍）
+            else:
+                multiplier = 2.0  # 超高负载：2倍（原1.5倍）
+            
+            timeout = min(base * multiplier, self.max_timeout)
             return int(timeout)
     
     def enter_request(self):
@@ -638,7 +652,7 @@ PROFESSIONAL_DICT = set()
 
 MONGO_URL = 'mongodb://root:example@10.70.223.31:27017'
 MONGO_DB = 'rqa'
-VERSION = 'v2.6_20251210_2000'  # v2.6 - 2025-12-10 20:00 - 防御性检查
+VERSION = 'v2.7_20251210_2100'  # v2.7 - 2025-12-10 21:00 - 超稳定版
 
 MONGO_PIPELINE = None
 MONGO_PIPELINE_RANK = None
@@ -1152,7 +1166,7 @@ def rerank_pipeline(**kwargs):
     
     sorted_chunks = sorted(result_dict.items(), key=lambda d: -d[1]['final_score'])
     
-    rerank_limit = 300
+    rerank_limit = 200  # v2.7: 300→200（减少重排数量）
     chunks_to_rerank = sorted_chunks[:rerank_limit]
     
     result_dict_sorted = {}
@@ -1160,7 +1174,7 @@ def rerank_pipeline(**kwargs):
         result_dict_sorted[key] = data.copy()
     
     bge_score_weight = 3.0
-    batch_size = 15
+    batch_size = 10  # v2.7: 15→10（减少批量大小）
     all_batches = []
     current_batch = []
     current_keys = []
@@ -1591,10 +1605,15 @@ def get_data():
                     print(f'[Request {req_id}] ❌ Recall failed after {time.time()-recall_start:.1f}s')
                     raise Exception("Recall failed")
                 
+                # v2.7: 强化防御 - 确保recall_result是字典
+                if not isinstance(recall_result, dict):
+                    print(f'[Request {req_id}] ❌ Recall returned invalid type: {type(recall_result)}')
+                    raise Exception(f"Recall returned {type(recall_result)}, expected dict")
+                
                 params.update(recall_result)
                 
-                # v2.6: 防御性检查 - 确保result_dict是字典
-                if not isinstance(params.get('result_dict'), dict):
+                # v2.7: 防御性检查 - 确保result_dict是字典
+                if 'result_dict' not in params or not isinstance(params.get('result_dict'), dict):
                     print(f'[Request {req_id}] ⚠️  Warning: result_dict is {type(params.get("result_dict"))}, resetting to empty dict')
                     params['result_dict'] = {}
                 
@@ -1626,7 +1645,15 @@ def get_data():
                 if rank_result is None:
                     print(f'[Request {req_id}] ⚠️  Ranking failed after {time.time()-rank_start:.1f}s, using recall results')
                 else:
-                    params.update(rank_result)
+                    # v2.7: 强化防御 - 确保rank_result是字典
+                    if not isinstance(rank_result, dict):
+                        print(f'[Request {req_id}] ⚠️  Ranking returned invalid type: {type(rank_result)}, ignoring')
+                    else:
+                        params.update(rank_result)
+                        # 再次检查result_dict
+                        if 'result_dict' not in params or not isinstance(params['result_dict'], dict):
+                            print(f'[Request {req_id}] ⚠️  result_dict corrupted after ranking, resetting')
+                            params['result_dict'] = result_dict  # 恢复原始值
                     print(f'[Request {req_id}] ✅ Ranking completed in {time.time()-rank_start:.1f}s')
                 
                 MONITOR.end_stage(req_id, 'ranking')
@@ -1648,7 +1675,15 @@ def get_data():
                 if rerank_result is None:
                     print(f'[Request {req_id}] ⚠️  Reranking failed after {time.time()-rerank_start:.1f}s, using previous results')
                 else:
-                    params.update(rerank_result)
+                    # v2.7: 强化防御 - 确保rerank_result是字典
+                    if not isinstance(rerank_result, dict):
+                        print(f'[Request {req_id}] ⚠️  Reranking returned invalid type: {type(rerank_result)}, ignoring')
+                    else:
+                        params.update(rerank_result)
+                        # 再次检查result_dict
+                        if 'result_dict' not in params or not isinstance(params['result_dict'], dict):
+                            print(f'[Request {req_id}] ⚠️  result_dict corrupted after reranking, resetting')
+                            params['result_dict'] = result_dict  # 恢复原始值
                     print(f'[Request {req_id}] ✅ Reranking completed in {time.time()-rerank_start:.1f}s')
                 
                 MONITOR.end_stage(req_id, 'reranking')
