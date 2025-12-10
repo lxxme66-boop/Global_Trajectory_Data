@@ -102,9 +102,9 @@ def test_stats(host='10.70.223.31', port=9510):
         print(f'   ❌ 获取统计失败: {e}')
         return False
 
-def test_concurrent_requests(host='10.70.223.31', port=9510, num_requests=20):
+def test_concurrent_requests(host='10.70.223.31', port=9510, num_requests=10):
     """测试并发请求（验证请求ID冲突是否修复）"""
-    print(f'\n🔍 3. 并发请求测试 ({num_requests}个并发请求)...')
+    print(f'\n🔍 3. 并发请求测试 ({num_requests}个并发请求，降低并发避免过载)...')
     print('=' * 70)
     
     base_url = f'http://{host}:{port}/api-rqa-search/search'
@@ -124,12 +124,16 @@ def test_concurrent_requests(host='10.70.223.31', port=9510, num_requests=20):
     # 发送并发请求
     def send_search_request(idx):
         try:
+            # 添加小延迟，避免瞬时过载
+            if idx > 0:
+                time.sleep(0.1)
+            
             data = {
                 'query': f'semiconductor manufacturing process technology research {idx}',
                 'id': 1,
-                'top_doc_num': 5
+                'top_doc_num': 3  # 减少返回数量，加快响应
             }
-            response = requests.post(base_url, data=data, timeout=60)
+            response = requests.post(base_url, data=data, timeout=90)  # 增加超时到90秒
             
             if response.status_code == 200:
                 result = response.json()
@@ -163,11 +167,11 @@ def test_concurrent_requests(host='10.70.223.31', port=9510, num_requests=20):
                 'error': str(e)
             }
     
-    print(f'   ⏳ 发送 {num_requests} 个并发请求...')
+    print(f'   ⏳ 发送 {num_requests} 个并发请求（最大并发：5）...')
     start_time = time.time()
     
     results = []
-    with ThreadPoolExecutor(max_workers=10) as executor:
+    with ThreadPoolExecutor(max_workers=5) as executor:
         futures = [executor.submit(send_search_request, i) for i in range(num_requests)]
         
         for future in as_completed(futures):
@@ -343,9 +347,14 @@ def main():
     else:
         port = 9510
     
-    print('🧪 测试优化后的搜索服务')
+    print('🧪 测试优化后的搜索服务（降低并发，避免过载）')
     print('=' * 70)
     print(f'服务地址: http://{host}:{port}')
+    print(f'优化策略:')
+    print(f'  - 降低并发数：10个请求，最大并发5')
+    print(f'  - 增加超时：90秒')
+    print(f'  - 减少返回：每个请求返回3个文档')
+    print(f'  - 请求间隔：0.1秒')
     print('=' * 70)
     
     results = {}

@@ -1415,10 +1415,22 @@ def get_data():
         if not top_doc_num:
             return json_result(-1, 'top_doc_num must not be null.', None)
         
+        # 检查并发负载，避免过载
+        current_active = TIMEOUT_MANAGER.active_requests
+        if current_active > 50:
+            print(f'[Request {req_id}] ⚠️  High load: {current_active} active requests, rejecting')
+            return json_result(-3, f'Server busy ({current_active} active requests)', {
+                'doc_num': 0,
+                'arr': [],
+                'ts': int(time.time() * 1000)
+            })
+        
         # 标记请求开始（必须在参数验证通过后）
         MONITOR.start_request(req_id, query)
         TIMEOUT_MANAGER.enter_request()
         request_started = True
+        
+        print(f'[Request {req_id}] Started, query: {query[:100]}, active: {current_active}')
         
         if is_delete == 1 and delete_doc_id:
             try:
@@ -1448,6 +1460,9 @@ def get_data():
             def execute_search():
                 # 阶段1: 编码
                 MONITOR.update_stage(req_id, 'encoding')
+                encoding_start = time.time()
+                print(f'[Request {req_id}] Stage 1: Encoding started')
+                
                 query_embed = safe_execute(
                     lambda: encode_from_net_cached(query),
                     timeout=TIMEOUT_MANAGER.get_timeout('encoding'),
@@ -1456,8 +1471,10 @@ def get_data():
                 )
                 
                 if query_embed is None:
+                    print(f'[Request {req_id}] ❌ Encoding failed after {time.time()-encoding_start:.1f}s')
                     raise Exception("Encoding failed")
                 
+                print(f'[Request {req_id}] ✅ Encoding completed in {time.time()-encoding_start:.1f}s')
                 MONITOR.end_stage(req_id, 'encoding')
                 
                 result_dict = {}
@@ -1478,6 +1495,9 @@ def get_data():
                 
                 # 阶段2: 召回
                 MONITOR.update_stage(req_id, 'recall')
+                recall_start = time.time()
+                print(f'[Request {req_id}] Stage 2: Recall started')
+                
                 recall_result = safe_execute(
                     lambda: recall_pipeline(**params),
                     timeout=TIMEOUT_MANAGER.get_timeout('recall'),
@@ -1486,16 +1506,23 @@ def get_data():
                 )
                 
                 if recall_result is None:
+                    print(f'[Request {req_id}] ❌ Recall failed after {time.time()-recall_start:.1f}s')
                     raise Exception("Recall failed")
                 
                 params.update(recall_result)
+                recall_count = len(params.get('result_dict', {}))
+                print(f'[Request {req_id}] ✅ Recall completed in {time.time()-recall_start:.1f}s, found {recall_count} chunks')
                 MONITOR.end_stage(req_id, 'recall')
                 
                 if not params['flag_query_rel']:
+                    print(f'[Request {req_id}] ⚠️  Query not relevant')
                     return {'code': 1, 'msg': 'query must be relevant', 'arr': [], 'doc_num': 0}
                 
                 # 阶段3: 排序
                 MONITOR.update_stage(req_id, 'ranking')
+                rank_start = time.time()
+                print(f'[Request {req_id}] Stage 3: Ranking started')
+                
                 rank_result = safe_execute(
                     lambda: rank_pipeline(**params),
                     timeout=TIMEOUT_MANAGER.get_timeout('rank'),
@@ -1504,14 +1531,18 @@ def get_data():
                 )
                 
                 if rank_result is None:
-                    print(f'[Request {req_id}] Ranking failed, using recall results')
+                    print(f'[Request {req_id}] ⚠️  Ranking failed after {time.time()-rank_start:.1f}s, using recall results')
                 else:
                     params.update(rank_result)
+                    print(f'[Request {req_id}] ✅ Ranking completed in {time.time()-rank_start:.1f}s')
                 
                 MONITOR.end_stage(req_id, 'ranking')
                 
                 # 阶段4: 重排
                 MONITOR.update_stage(req_id, 'reranking')
+                rerank_start = time.time()
+                print(f'[Request {req_id}] Stage 4: Reranking started')
+                
                 rerank_result = safe_execute(
                     lambda: rerank_pipeline(**params),
                     timeout=TIMEOUT_MANAGER.get_timeout('rerank_total'),
@@ -1520,14 +1551,18 @@ def get_data():
                 )
                 
                 if rerank_result is None:
-                    print(f'[Request {req_id}] Reranking failed, using previous results')
+                    print(f'[Request {req_id}] ⚠️  Reranking failed after {time.time()-rerank_start:.1f}s, using previous results')
                 else:
                     params.update(rerank_result)
+                    print(f'[Request {req_id}] ✅ Reranking completed in {time.time()-rerank_start:.1f}s')
                 
                 MONITOR.end_stage(req_id, 'reranking')
                 
                 # 阶段5: 拼接
                 MONITOR.update_stage(req_id, 'concatenating')
+                concat_start = time.time()
+                print(f'[Request {req_id}] Stage 5: Concatenating started')
+                
                 params['top_doc_num'] = top_doc_num
                 params['concat_num'] = CONCAT_CHUNK_NUM
                 params['is_debug'] = is_debug
@@ -1539,6 +1574,7 @@ def get_data():
                     operation_name="Concatenation"
                 )
                 
+                print(f'[Request {req_id}] ✅ Concatenation completed in {time.time()-concat_start:.1f}s, got {len(similar_shards)} results')
                 MONITOR.end_stage(req_id, 'concatenating')
                 
                 json_arr = []
@@ -1548,6 +1584,7 @@ def get_data():
                         continue
                     json_arr.append(dict_item)
                 
+                print(f'[Request {req_id}] 🎯 Final results: {len(json_arr)} docs (after score filter)')
                 return {'code': 0, 'msg': '', 'arr': json_arr, 'doc_num': len(json_arr)}
             
             # 执行搜索（带强制总超时）
