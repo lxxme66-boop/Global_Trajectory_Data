@@ -849,18 +849,105 @@ def encode_from_net(querys):
     return response.json()['embeddings']
 
 def rerank_pipeline(**kwargs):
+    """重排 pipeline（增强版 - 修复 score count mismatch 和 timeout 问题）"""
     print('################## process rerank pipeline ##################')
     bge_server_url = RERANKER_URL
     bge_score_weight = 3.0 
+    batch_size = 12  # 减小批次大小：20 -> 12，降低服务端压力和超时风险
 
     query: str = kwargs['query']
     result_dict: dict = kwargs['result_dict']
     
-    # ========== 修改开始 ==========
-    # 旧代码保持不变，但要注意 result_dict 的 key 现在是 combined_key
     sorted_top_chunk = sorted(result_dict.items(), key=lambda d: -d[1]['final_score'])
     result_dict_sorted = {}
     bge_score_buff_dict = [[], []]
+    
+    batch_count = 0
+    success_count = 0
+    fail_count = 0
+    
+    def process_batch_with_retry(keys, pairs, retry_count=0, max_retries=2):
+        """处理单个批次，带智能重试和降级策略"""
+        try:
+            bge_multi_data = {'type': 'multi', 'multi_data': pairs}
+            
+            # 动态超时：基础30秒 + 每对3秒
+            read_timeout = 30 + len(pairs) * 3
+            
+            response = HTTP_SESSION.post(
+                bge_server_url, 
+                data=json.dumps(bge_multi_data), 
+                timeout=(15, read_timeout)
+            )
+            
+            if response.status_code != 200:
+                raise Exception(f"HTTP {response.status_code}")
+            
+            bge_rerank_score_list = response.json()['score']
+            
+            # 关键修复：检查 score 数量是否匹配
+            if len(bge_rerank_score_list) != len(keys):
+                error_msg = f"Score count mismatch: expected {len(keys)}, got {len(bge_rerank_score_list)}"
+                
+                # 如果不匹配且还能重试，尝试分批处理
+                if retry_count < max_retries and len(keys) > 3:
+                    print(f'[Rerank] Batch {batch_count}: {error_msg}, splitting into smaller batches...')
+                    
+                    # 分成两半
+                    mid = len(keys) // 2
+                    success1 = process_batch_with_retry(keys[:mid], pairs[:mid], retry_count + 1, max_retries)
+                    success2 = process_batch_with_retry(keys[mid:], pairs[mid:], retry_count + 1, max_retries)
+                    
+                    return success1 or success2  # 只要有一个成功就算部分成功
+                else:
+                    print(f'[Rerank] Batch {batch_count} error: {error_msg}')
+                    return False
+            
+            # 应用分数
+            for score_index in range(len(bge_rerank_score_list)):
+                try:
+                    score_value = bge_rerank_score_list[score_index]
+                    # 处理可能的嵌套列表
+                    if isinstance(score_value, list):
+                        score_value = score_value[0]
+                    
+                    rank_score = result_dict_sorted[keys[score_index]]['final_score'] + \
+                                 bge_score_weight * float(score_value)
+                    result_dict_sorted[keys[score_index]]['rerank_score'] = rank_score
+                    result_dict_sorted[keys[score_index]]['final_score'] = rank_score
+                except (IndexError, ValueError, TypeError) as e:
+                    print(f'[Rerank] Error applying score at index {score_index}: {e}')
+                    result_dict_sorted[keys[score_index]]['rerank_score'] = \
+                        result_dict_sorted[keys[score_index]]['final_score']
+            
+            return True
+            
+        except requests.exceptions.Timeout as e:
+            # 超时错误：尝试重试或分批
+            if retry_count < max_retries:
+                if len(keys) > 5:
+                    print(f'[Rerank] Batch {batch_count} timeout, splitting batch (retry {retry_count + 1})...')
+                    mid = len(keys) // 2
+                    success1 = process_batch_with_retry(keys[:mid], pairs[:mid], retry_count + 1, max_retries)
+                    success2 = process_batch_with_retry(keys[mid:], pairs[mid:], retry_count + 1, max_retries)
+                    return success1 or success2
+                else:
+                    print(f'[Rerank] Batch {batch_count} timeout, retrying (attempt {retry_count + 1})...')
+                    time.sleep(1 * (retry_count + 1))
+                    return process_batch_with_retry(keys, pairs, retry_count + 1, max_retries)
+            
+            print(f'[Rerank] Batch {batch_count} error: {type(e).__name__}')
+            return False
+            
+        except Exception as e:
+            # 其他错误：重试
+            if retry_count < max_retries:
+                print(f'[Rerank] Batch {batch_count} error: {str(e)[:100]}, retrying...')
+                time.sleep(0.5 * (retry_count + 1))
+                return process_batch_with_retry(keys, pairs, retry_count + 1, max_retries)
+            
+            print(f'[Rerank] Batch {batch_count} error: {str(e)[:100]}')
+            return False
         
     for index in range(len(sorted_top_chunk)):
         combined_key = sorted_top_chunk[index][0]  # 这是 "index_docid" 格式
@@ -872,46 +959,63 @@ def rerank_pipeline(**kwargs):
         result_dict_sorted[combined_key] = chunk_data
         
         if index < 300:
-            bge_score_buff_dict[0].append(combined_key)
-            bge_score_buff_dict[1].append([query, chunk_data['shard']])
+            # 文本预处理：清理特殊字符，智能截断
+            shard_text = chunk_data['shard']
+            if len(shard_text) > 1000:
+                # 在句子边界截断
+                truncated = shard_text[:1000]
+                for punct in ['。', '！', '？', '.', '!', '?', '\n']:
+                    last_idx = truncated.rfind(punct)
+                    if last_idx > 700:
+                        truncated = truncated[:last_idx + 1]
+                        break
+                shard_text = truncated
             
-            if len(bge_score_buff_dict[0]) == 20:
-                print(f"[DEBUG] 发送批量请求，批量大小: {len(bge_score_buff_dict[0])}")
-                bge_multi_data = {'type': 'multi', 'multi_data': bge_score_buff_dict[1]}
-                bge_rerank_score_data_list = HTTP_SESSION.post(bge_server_url, data=json.dumps(bge_multi_data), timeout=(500, 12000))
-                bge_rerank_score_list = bge_rerank_score_data_list.json()['score']
-                assert len(bge_rerank_score_list) == len(bge_score_buff_dict[0])
+            # 移除空字符和多余空白
+            shard_text = shard_text.replace('\x00', '').strip()
+            if not shard_text:
+                continue
+            
+            bge_score_buff_dict[0].append(combined_key)
+            bge_score_buff_dict[1].append([query, shard_text])
+            
+            if len(bge_score_buff_dict[0]) >= batch_size:
+                batch_count += 1
+                print(f"[Rerank] Processing batch {batch_count}, size: {len(bge_score_buff_dict[0])}")
                 
-                for score_index in range(len(bge_rerank_score_list)):
-                    rank_score = result_dict_sorted[bge_score_buff_dict[0][score_index]]['final_score'] + \
-                            bge_score_weight * bge_rerank_score_list[score_index]
-                    result_dict_sorted[bge_score_buff_dict[0][score_index]]['rerank_score'] = rank_score
-                    result_dict_sorted[bge_score_buff_dict[0][score_index]]['final_score'] = rank_score
+                if process_batch_with_retry(bge_score_buff_dict[0], bge_score_buff_dict[1]):
+                    success_count += 1
+                else:
+                    fail_count += 1
+                    # 失败降级：使用原始分数
+                    for combined_key in bge_score_buff_dict[0]:
+                        result_dict_sorted[combined_key]['rerank_score'] = \
+                            result_dict_sorted[combined_key]['final_score']
                 
                 bge_score_buff_dict = [[], []]
         else:
+            # 对于排名300之后的，使用默认惩罚分数
             bge_rerank_score = -8.0
             rank_score = result_dict_sorted[combined_key]['final_score'] + bge_score_weight + bge_rerank_score
             result_dict_sorted[combined_key]['rerank_score'] = rank_score
             result_dict_sorted[combined_key]['final_score'] = rank_score
 
+    # 处理最后一个不满批次
     if len(bge_score_buff_dict[0]) > 0:
-        bge_multi_data = {'type': 'multi', 'multi_data': bge_score_buff_dict[1]}
-        bge_rerank_score_data_list = HTTP_SESSION.post(bge_server_url, data=json.dumps(bge_multi_data), timeout=(500, 12000))
-        bge_rerank_score_list = bge_rerank_score_data_list.json()['score']
-        assert len(bge_rerank_score_list) == len(bge_score_buff_dict[0])
+        batch_count += 1
+        print(f"[Rerank] Processing final batch {batch_count}, size: {len(bge_score_buff_dict[0])}")
         
-        for score_index in range(len(bge_rerank_score_list)):
-            try:
-                rank_score = result_dict_sorted[bge_score_buff_dict[0][score_index]]['final_score'] + \
-                                bge_score_weight * bge_rerank_score_list[score_index]
-            except:
-                rank_score = result_dict_sorted[bge_score_buff_dict[0][score_index]]['final_score'] + \
-                                bge_score_weight * bge_rerank_score_list[score_index][0]
-            result_dict_sorted[bge_score_buff_dict[0][score_index]]['rerank_score'] = rank_score
-            result_dict_sorted[bge_score_buff_dict[0][score_index]]['final_score'] = rank_score
+        if process_batch_with_retry(bge_score_buff_dict[0], bge_score_buff_dict[1]):
+            success_count += 1
+        else:
+            fail_count += 1
+            for combined_key in bge_score_buff_dict[0]:
+                result_dict_sorted[combined_key]['rerank_score'] = \
+                    result_dict_sorted[combined_key]['final_score']
+        
         bge_score_buff_dict = [[], []]
-    # ========== 修改结束 ==========
+    
+    print(f'[Rerank] Completed: {success_count} successful, {fail_count} failed out of {batch_count} batches')
              
     result_dict = result_dict_sorted
 
@@ -921,9 +1025,6 @@ def rerank_pipeline(**kwargs):
 
     kw_num, weight_num = len(kw_zh), 0
     
-    # ========== 修改开始 ==========
-    # 旧代码：for (id, row) in result_dict.items():
-    # 新代码：combined_key 作为 key
     for (combined_key, row) in result_dict.items():
         match_cnt = 0
         if row.get('final_score', 0) < 0.4 or 'shard' not in row:
@@ -943,9 +1044,8 @@ def rerank_pipeline(**kwargs):
         row['match_cnt'] = match_cnt
         row['match_score'] = match_score
         row['final_score'] = row['final_score'] * match_score
-    # ========== 修改结束 ==========
 
-    print(f'keyword weight num = {weight_num}')
+    print(f'[Rerank] keyword weight num = {weight_num}')
     kwargs['result_dict'] = result_dict
     return kwargs
 
