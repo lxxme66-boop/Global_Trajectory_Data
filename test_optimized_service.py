@@ -8,9 +8,10 @@
 - v1.0 (2025-12-10 14:00) 初始测试版本
 - v1.1 (2025-12-10 16:00) 区分HTTP成功和业务成功
 - v1.2 (2025-12-10 17:00) 降低并发，增加诊断信息
+- v1.3 (2025-12-10 20:10) 增加超时到300秒（适配串行重排）
 
-当前版本：v1.2
-最后修改时间：2025-12-10 17:00
+当前版本：v1.3
+最后修改时间：2025-12-10 20:10
 """
 
 import requests
@@ -141,7 +142,7 @@ def test_concurrent_requests(host='10.70.223.31', port=9510, num_requests=10):
                 'id': 1,
                 'top_doc_num': 3  # 减少返回数量，加快响应
             }
-            response = requests.post(base_url, data=data, timeout=90)  # 增加超时到90秒
+            response = requests.post(base_url, data=data, timeout=300)  # v1.3: 串行重排需要更长超时
             
             if response.status_code == 200:
                 result = response.json()
@@ -313,7 +314,7 @@ def test_single_search(host='10.70.223.31', port=9510):
         print(f'   ⏳ 发送搜索请求...')
         start_time = time.time()
         
-        response = requests.post(base_url, data=data, timeout=60)
+        response = requests.post(base_url, data=data, timeout=300)  # v1.3: 增加超时
         duration = time.time() - start_time
         
         if response.status_code == 200:
@@ -360,7 +361,7 @@ def main():
     print(f'服务地址: http://{host}:{port}')
     print(f'优化策略:')
     print(f'  - 降低并发数：10个请求，最大并发5')
-    print(f'  - 增加超时：90秒')
+    print(f'  - 增加超时：300秒（适配串行重排）')
     print(f'  - 减少返回：每个请求返回3个文档')
     print(f'  - 请求间隔：0.1秒')
     print('=' * 70)
