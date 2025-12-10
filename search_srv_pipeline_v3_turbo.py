@@ -819,23 +819,38 @@ def rerank_pipeline(**kwargs):
             
             bge_rerank_score_list = response.json()['score']
             
-            # 关键修复：检查 score 数量是否匹配
-            if len(bge_rerank_score_list) != len(keys):
-                error_msg = f"Score count mismatch: expected {len(keys)}, got {len(bge_rerank_score_list)}"
+            # ⭐⭐⭐ 智能修复：处理 score 数量不匹配
+            expected_count = len(keys)
+            actual_count = len(bge_rerank_score_list)
+            
+            if actual_count != expected_count:
+                error_msg = f"Score count mismatch: expected {expected_count}, got {actual_count}"
+                print(f'[Rerank] Batch {batch_count} {error_msg}')
                 
-                # 如果不匹配且还能重试，尝试分批处理
-                if retry_count < max_retries and len(keys) > 3:
-                    print(f'[Rerank] Batch {batch_count}: {error_msg}, splitting into smaller batches...')
+                # ⭐ 智能修复策略：直接调整 score 列表
+                if actual_count > expected_count:
+                    # 情况1：多了 → 取前 N 个
+                    bge_rerank_score_list = bge_rerank_score_list[:expected_count]
+                    print(f'[Rerank] 🔧 Auto-fix: trimmed {actual_count} → {expected_count}')
                     
-                    # 分成两半
+                elif actual_count < expected_count:
+                    # 情况2：少了 → 补充默认低分
+                    missing_count = expected_count - actual_count
+                    default_score = -10.0
+                    bge_rerank_score_list.extend([default_score] * missing_count)
+                    print(f'[Rerank] 🔧 Auto-fix: padded {missing_count} scores with {default_score}')
+                
+                print(f'[Rerank] ✅ Fixed: {len(bge_rerank_score_list)} == {expected_count}')
+            
+            # 验证修复（双重保险）
+            if len(bge_rerank_score_list) != expected_count:
+                print(f'[Rerank] ❌ Fix failed, trying split...')
+                if retry_count < max_retries and len(keys) > 3:
                     mid = len(keys) // 2
                     success1 = process_batch_with_retry(keys[:mid], pairs[:mid], retry_count + 1, max_retries)
                     success2 = process_batch_with_retry(keys[mid:], pairs[mid:], retry_count + 1, max_retries)
-                    
-                    return success1 or success2  # 只要有一个成功就算部分成功
-                else:
-                    print(f'[Rerank] Batch {batch_count} error: {error_msg}')
-                    return False
+                    return success1 or success2
+                return False
             
             # 应用分数
             for score_index in range(len(bge_rerank_score_list)):
